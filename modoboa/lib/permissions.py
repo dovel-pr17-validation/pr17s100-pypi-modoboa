@@ -1,0 +1,359 @@
+"""Object level permissions."""
+
+from collections import defaultdict
+
+from django.contrib.auth.models import Group, Permission
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import QuerySet
+from django.utils.translation import gettext as _
+
+from rest_framework import permissions, serializers
+
+from modoboa.core import constants as core_constants, signals as core_signals
+from modoboa.core.models import ObjectAccess, User
+
+
+def check_mailbox_ownership(user, mailbox):
+    """Check that user is allowed to manipulate the given mailbox.
+
+    :param user: a ``User`` instance (the current request user)
+    :param mailbox: a ``Mailbox`` instance
+    :raises serializers.ValidationError: if user has no ownership
+    """
+    from modoboa.admin import models as admin_models
+
+    role = user.role
+    if role == "SimpleUsers" and user.mailbox != mailbox:
+        raise serializers.ValidationError(_("You don't have ownership on this mailbox"))
+    elif role in ["DomainAdmins", "Resellers"]:
+        mailboxes = admin_models.Mailbox.objects.get_for_admin(user)
+        if mailbox not in mailboxes:
+            raise serializers.ValidationError(
+                _("You don't have ownership on this mailbox")
+            )
+
+
+def get_account_roles(user, account=None):
+    """Return the list of available account roles.
+
+    This function is used to create or modify an account.
+
+    :param ``User`` user: connected user
+    :param ``User`` account: account beeing modified (None on creation)
+    :return: list of strings
+    """
+    if account and user == account:
+        # Special case to ensure a user cannot change its own role
+        return [(user.role, "")]
+    result = [core_constants.SIMPLEUSERS_ROLE]
+    filters = core_signals.user_can_set_role.send(
+        sender="get_account_roles", user=user, role="DomainAdmins", account=account
+    )
+    condition = user.has_perm("admin.add_domain") and (
+        not filters or True in [flt[1] for flt in filters]
+    )
+    if condition:
+        result += [core_constants.DOMAINADMINS_ROLE]
+    if user.is_superuser:
+        result += [core_constants.RESELLERS_ROLE, core_constants.SUPERADMINS_ROLE]
+    return sorted(result, key=lambda role: role[1])
+
+
+def grant_access_to_object(user, obj, is_owner=False, superusers=None):
+    """Grant access to an object for a given user
+
+    There are two different cases where we want to grant access to an
+    object for a specific user:
+
+    * He is the owner (he's just created the object)
+    * He is going to administrate the object (but he is not the owner)
+
+    If the user is the owner, we also grant access to this object to
+    all super users.
+
+    :param user: a ``User`` object
+    :param obj: an admin. object (Domain, Mailbox, ...)
+    :param is_owner: the user is the unique object's owner
+    :param superusers: pre-fetched super users, to avoid querying them
+                       again on each call when granting access in bulk
+    """
+    ct = ContentType.objects.get_for_model(obj)
+    entry, created = ObjectAccess.objects.get_or_create(
+        user=user, content_type=ct, object_id=obj.id, defaults={"is_owner": is_owner}
+    )
+    if entry.is_owner != is_owner:
+        entry.is_owner = is_owner
+        entry.save(update_fields=["is_owner"])
+    if not created or not is_owner:
+        return
+    if superusers is None:
+        superusers = User.objects.filter(is_superuser=True)
+    ObjectAccess.objects.bulk_create(
+        [
+            ObjectAccess(user=su, content_type=ct, object_id=obj.id)
+            for su in superusers
+            if su != user
+        ],
+        ignore_conflicts=True,
+    )
+
+
+def grant_access_to_objects(user, objects, ct):
+    """Grant access to a collection of objects
+
+    All objects in the collection must share the same type (ie. ``ct``
+    applies to all objects).
+
+    :param user: a ``User`` object
+    :param objects: a list of objects or a ``QuerySet``
+    :param ct: the content type
+    """
+    if isinstance(objects, QuerySet):
+        # Only primary keys are needed: don't build model instances, some
+        # of them query the database on their own to initialize.
+        object_ids = objects.values_list("pk", flat=True)
+    else:
+        object_ids = (obj.id for obj in objects)
+    granted = set(
+        ObjectAccess.objects.filter(user=user, content_type=ct).values_list(
+            "object_id", flat=True
+        )
+    )
+    ObjectAccess.objects.bulk_create(
+        [
+            ObjectAccess(user=user, content_type=ct, object_id=object_id)
+            for object_id in object_ids
+            if object_id not in granted
+        ],
+        batch_size=1000,
+        ignore_conflicts=True,
+    )
+
+
+def transfer_ownership(user, new_owner=None):
+    """Give the objects owned by an account to another one.
+
+    Must be called before an account loses its permissions (deletion,
+    role downgrade): its ``ObjectAccess`` entries are then removed, and
+    without this every object it owned would be left without any owner.
+
+    :param user: the current owner
+    :param new_owner: the account to transfer ownership to. Defaults to
+                      the owner of ``user``, then to the first active
+                      super admin.
+    :return: the new owner, or ``None`` if no candidate was found
+    """
+    if new_owner is None or new_owner == user:
+        new_owner = get_object_owner(user)
+    if new_owner is None or new_owner == user:
+        new_owner = (
+            User.objects.filter(is_superuser=True, is_active=True)
+            .exclude(pk=user.pk)
+            .first()
+        )
+    if new_owner is None:
+        return None
+    owned = defaultdict(set)
+    for content_type_id, object_id in user.objectaccess_set.filter(
+        is_owner=True
+    ).values_list("content_type_id", "object_id"):
+        owned[content_type_id].add(object_id)
+    for content_type_id, object_ids in owned.items():
+        # The new owner may already have a non owner access to some of
+        # those objects: update the existing entries, create the others.
+        existing = set(
+            ObjectAccess.objects.filter(
+                user=new_owner,
+                content_type_id=content_type_id,
+                object_id__in=object_ids,
+            ).values_list("object_id", flat=True)
+        )
+        if existing:
+            ObjectAccess.objects.filter(
+                user=new_owner, content_type_id=content_type_id, object_id__in=existing
+            ).update(is_owner=True)
+        ObjectAccess.objects.bulk_create(
+            [
+                ObjectAccess(
+                    user=new_owner,
+                    content_type_id=content_type_id,
+                    object_id=object_id,
+                    is_owner=True,
+                )
+                for object_id in object_ids - existing
+            ],
+            batch_size=1000,
+            ignore_conflicts=True,
+        )
+    return new_owner
+
+
+def revoke_access_from_lower_roles(account):
+    """Revoke the access held on an account by accounts with a lower role.
+
+    The access held on the account's mailbox (if any) is also
+    revoked. If one of the revoked entries was the owner, ownership
+    is given to the first active super admin found.
+
+    :param account: a ``User`` instance
+    """
+    objects = [account]
+    mailbox = getattr(account, "mailbox", None)
+    if mailbox is not None:
+        objects.append(mailbox)
+    for obj in objects:
+        ct = ContentType.objects.get_for_model(obj)
+        entries = (
+            ObjectAccess.objects.filter(
+                content_type=ct, object_id=obj.pk, user__is_superuser=False
+            )
+            .exclude(user=account)
+            .select_related("user")
+        )
+        revoked = [entry for entry in entries if entry.user.is_outranked_by(account)]
+        if not revoked:
+            continue
+        ObjectAccess.objects.filter(pk__in=[entry.pk for entry in revoked]).delete()
+        if not any(entry.is_owner for entry in revoked):
+            continue
+        new_owner = (
+            User.objects.filter(is_superuser=True, is_active=True)
+            .exclude(pk=account.pk)
+            .first()
+        )
+        if new_owner is not None:
+            grant_access_to_object(new_owner, obj, is_owner=True)
+
+
+def exclude_higher_roles(user, queryset):
+    """Remove the accounts with a higher role than user's from queryset.
+
+    :param user: a ``User`` instance
+    :param queryset: a ``User`` queryset
+    :return: the filtered queryset
+    """
+    if user.is_superuser:
+        return queryset
+    higher_roles = [
+        role
+        for role, rank in core_constants.ROLE_RANKS.items()
+        if rank > user.role_rank
+    ]
+    return queryset.exclude(is_superuser=True).exclude(groups__name__in=higher_roles)
+
+
+def ungrant_access_to_object(obj, user=None):
+    """Ungrant access to an object for a specific user
+
+    If no user is provided, all entries referencing this object are
+    deleted from the database.
+
+    If a user is provided, we only remove his access. If it was the
+    owner, we give the ownership to the first super admin we find.
+
+    :param obj: an object inheriting from ``models.Model``
+    :param user: a ``User`` object
+    """
+    ct = ContentType.objects.get_for_model(obj)
+    if user is not None:
+        try:
+            ObjectAccess.objects.get(
+                user=user, content_type=ct, object_id=obj.id
+            ).delete()
+        except ObjectAccess.DoesNotExist:
+            pass
+        try:
+            ObjectAccess.objects.get(content_type=ct, object_id=obj.id, is_owner=True)
+        except ObjectAccess.DoesNotExist:
+            grant_access_to_object(User.objects.filter(is_superuser=True)[0], obj, True)
+    else:
+        ObjectAccess.objects.filter(content_type=ct, object_id=obj.id).delete()
+
+
+def ungrant_access_to_objects(objects):
+    """Cancel all accesses for a given object list.
+
+    :param objects: a list of objects inheriting from ``models.Model``
+    """
+    for obj in objects:
+        ct = ContentType.objects.get_for_model(obj)
+        ObjectAccess.objects.filter(content_type=ct, object_id=obj.id).delete()
+
+
+def get_object_owner(obj):
+    """Return the unique owner of this object
+
+    :param obj: an object inheriting from ``model.Model``
+    :return: a ``User`` object
+    """
+    ct = ContentType.objects.get_for_model(obj)
+    try:
+        entry = ObjectAccess.objects.get(
+            content_type=ct, object_id=obj.id, is_owner=True
+        )
+    except ObjectAccess.DoesNotExist:
+        return None
+    return entry.user
+
+
+def add_permissions_to_group(group, permissions):
+    """Add the specified permissions to a django group."""
+    if isinstance(group, str):
+        group = Group.objects.get(name=group)
+
+    for appname, modelname, permname in permissions:
+        ct = ContentType.objects.get_by_natural_key(appname, modelname)
+        if group.permissions.filter(content_type=ct, codename=permname).exists():
+            continue
+        group.permissions.add(
+            Permission.objects.get(content_type=ct, codename=permname)
+        )
+
+
+class IsSuperUser(permissions.BasePermission):
+    """Permission class to allow only super users."""
+
+    def has_permission(self, request, view):
+        return request.user.is_superuser
+
+
+class IsPrivilegedUser(permissions.BasePermission):
+    """Permission class to allow any privileged user."""
+
+    def has_permission(self, request, view):
+        return request.user.role != core_constants.SIMPLEUSERS_ROLE[0]
+
+
+class CanCreateDomain(permissions.BasePermission):
+    """Permissions class to allow users with add_domain right."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("admin.add_domain")
+
+
+class CanViewDomain(permissions.BasePermission):
+    """Permissions class to allow users with view_domain right."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("admin.view_domain")
+
+
+class CanChangeDomain(permissions.BasePermission):
+    """Permissions class to allow users with change_domain right."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("admin.change_domain")
+
+
+class CanDeleteDomain(permissions.BasePermission):
+    """Permissions class to allow users with delete_domain right."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("admin.delete_domain")
+
+
+class CanDeleteUser(permissions.BasePermission):
+    """Permissions class to allow users with delete_user right."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("core.delete_user")

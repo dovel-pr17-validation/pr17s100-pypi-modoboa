@@ -1,0 +1,135 @@
+"""Contacts viewsets."""
+
+import django_filters.rest_framework
+import django_rq
+from rest_framework.decorators import action
+from rest_framework import filters, response, viewsets
+from rest_framework.permissions import IsAuthenticated
+
+from modoboa.lib import pagination
+from modoboa.lib.oauth2 import get_access_token
+
+from . import models
+from . import serializers
+from . import tasks
+
+
+class AddressBookViewSet(viewsets.GenericViewSet):
+    """Address book viewset."""
+
+    permission_classes = (IsAuthenticated,)
+    serializer_class = serializers.AddressBookSerializer
+
+    @action(methods=["get"], detail=False)
+    def default(self, request):
+        """Return default user address book."""
+        abook = request.user.addressbook_set.first()
+        if not abook:
+            return response.Response(status=404)
+        serializer = serializers.AddressBookSerializer(abook)
+        return response.Response(serializer.data)
+
+    @action(methods=["post"], detail=False)
+    def sync_to_cdav(self, request):
+        """Push address book to CardDAV collection (initial sync)."""
+        abook = request.user.addressbook_set.first()
+        if not abook:
+            return response.Response(status=404)
+        if not abook.last_sync and request.user.parameters.get_value(
+            "enable_carddav_sync", app="contacts"
+        ):
+            queue = django_rq.get_queue("modoboa")
+            queue.enqueue(
+                tasks.push_addressbook_to_carddav, abook.pk, get_access_token(request)
+            )
+        return response.Response({})
+
+    @action(methods=["post"], detail=False)
+    def sync_from_cdav(self, request):
+        """Synchronize from CardDAV address book."""
+        abook = request.user.addressbook_set.first()
+        if not abook:
+            return response.Response(status=404)
+        if not abook.last_sync:
+            return response.Response()
+        if request.user.parameters.get_value("enable_carddav_sync", app="contacts"):
+            queue = django_rq.get_queue("modoboa")
+            queue.enqueue(
+                tasks.sync_addressbook_from_cdav, abook.pk, get_access_token(request)
+            )
+        return response.Response({})
+
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    """Category ViewSet."""
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = serializers.CategorySerializer
+
+    def get_queryset(self):
+        """Filter based on current user."""
+        qset = models.Category.objects.filter(user=self.request.user)
+        return qset.select_related("user")
+
+
+class ContactFilter(django_filters.rest_framework.FilterSet):
+    """Filter for Contact."""
+
+    category = django_filters.CharFilter(field_name="categories__name")
+
+    class Meta:
+        model = models.Contact
+        fields = ["categories"]
+
+
+class ContactViewSet(viewsets.ModelViewSet):
+    """Contact ViewSet."""
+
+    filter_backends = [
+        filters.OrderingFilter,
+        filters.SearchFilter,
+        django_filters.rest_framework.DjangoFilterBackend,
+    ]
+    filterset_class = ContactFilter
+    pagination_class = pagination.CustomPageNumberPagination
+    permission_classes = [IsAuthenticated]
+    search_fields = (
+        "^display_name",
+        "^first_name",
+        "^last_name",
+        "^emails__address",
+    )
+    serializer_class = serializers.ContactSerializer
+
+    def get_queryset(self):
+        """Filter based on current user."""
+        qset = models.Contact.objects.filter(addressbook__user=self.request.user)
+        return qset.prefetch_related("categories", "emails", "phone_numbers")
+
+    def perform_destroy(self, instance):
+        """Also remove cdav contact."""
+        if instance.addressbook.last_sync and self.request.user.parameters.get_value(
+            "enable_carddav_sync", app="contacts"
+        ):
+            tasks.delete_contact_cdav(self.request, instance)
+        instance.delete()
+
+
+class EmailAddressViewSet(viewsets.ReadOnlyModelViewSet):
+    """EmailAddress viewset."""
+
+    filter_backends = [filters.SearchFilter]
+    permission_classes = [IsAuthenticated]
+    search_fields = (
+        "^address",
+        "^contact__display_name",
+        "^contact__first_name",
+        "^contact__last_name",
+    )
+    serializer_class = serializers.EmailAddressWithNameSerializer
+
+    def get_queryset(self):
+        """Filter based on current user."""
+        return models.EmailAddress.objects.filter(
+            contact__addressbook__user=self.request.user
+        ).select_related("contact")

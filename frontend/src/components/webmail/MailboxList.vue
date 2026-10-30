@@ -1,0 +1,225 @@
+<template>
+  <div>
+    <div
+      v-for="mailbox in props.mailboxes"
+      :key="mailbox.name"
+      class="pl-3 text-body-medium"
+      :class="{ 'py-1': !props.compact }"
+    >
+      <div
+        :class="getBackgroundColorClass(mailbox)"
+        class="d-flex mailbox pa-1 align-center"
+        @click="onClick(mailbox)"
+        @mouseover="setHover(mailbox, true)"
+        @mouseleave="setHover(mailbox, false)"
+        @dragover.prevent
+        @dragenter="setHover(mailbox, true)"
+        @dragleave="setHover(mailbox, false)"
+        @drop.prevent="onDrop(mailbox)"
+      >
+        <v-icon :icon="getMailboxIcon(mailbox)" class="mr-4" />
+        <template v-if="!props.rail">
+          <span v-if="mailbox.unseen > 0" class="font-weight-bold">
+            {{ getMailboxLabel(mailbox) }} ({{ mailbox.unseen }})
+          </span>
+          <span v-else>
+            {{ getMailboxLabel(mailbox) }}
+          </span>
+          <v-spacer />
+          <v-btn
+            v-if="mailbox.sub"
+            :icon="getMailboxState(mailbox) ? 'mdi-minus' : 'mdi-plus'"
+            size="xsmall"
+            variant="flat"
+            color="transparent"
+            @click.stop="toggleMailbox(mailbox)"
+          />
+        </template>
+      </div>
+      <MailboxList
+        v-if="getMailboxState(mailbox) && mailbox.sub && mailbox.sub.length"
+        v-model="model"
+        :mailboxes="mailbox.sub"
+        :hdelimiter="props.hdelimiter"
+        class="mt-1"
+        :light-mode="props.lightMode"
+        :compact="props.compact"
+      />
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+import { useRoute } from 'vue-router'
+import { useGettext } from 'vue3-gettext'
+import { useBusStore, useWebmailStore } from '@/stores'
+import api from '@/api/webmail'
+
+const props = defineProps({
+  mailboxes: {
+    type: Array,
+    default: null,
+  },
+  lightMode: {
+    type: Boolean,
+    default: false,
+  },
+  compact: {
+    type: Boolean,
+    default: false,
+  },
+  unseenCounters: {
+    type: Boolean,
+    default: true,
+  },
+  allowUnselect: {
+    type: Boolean,
+    default: false,
+  },
+  rail: {
+    type: Boolean,
+    default: false,
+  },
+  hdelimiter: {
+    type: String,
+    default: '/',
+  },
+})
+const model = defineModel()
+const emit = defineEmits(['update:modelValue'])
+
+const route = useRoute()
+const { $gettext } = useGettext()
+const busStore = useBusStore()
+const webmailStore = useWebmailStore()
+
+const iconByMailboxType = {
+  inbox: 'mdi-inbox',
+  draft: 'mdi-file',
+  junk: 'mdi-fire',
+  sent: 'mdi-email-fast-outline',
+  scheduled: 'mdi-send-clock-outline',
+  trash: 'mdi-trash-can-outline',
+  normal: 'mdi-folder-outline',
+  shared: 'mdi-folder-account-outline',
+}
+
+// The levels of the shared namespace: the root, then one per owner.
+// ponytail: assumes a one-level prefix ("shared/"), as modoboa-installer
+// configures it.
+function isSharedLevel(mailbox) {
+  return (
+    mailbox.type === 'shared' &&
+    mailbox.name.split(props.hdelimiter).length <= 2
+  )
+}
+
+// They only group the shared folders, except an owner level the user can
+// select: Dovecot lists the shared INBOX under the owner name.
+function isSharedContainer(mailbox) {
+  return isSharedLevel(mailbox) && !mailbox.selectable
+}
+
+function getMailboxIcon(mailbox) {
+  if (isSharedLevel(mailbox)) {
+    return mailbox.owner
+      ? 'mdi-account-outline'
+      : 'mdi-account-multiple-outline'
+  }
+  return iconByMailboxType[mailbox.type]
+}
+
+const hoverStates = ref({})
+const mailboxStates = ref({})
+
+function getMailboxLabel(mailbox) {
+  return mailbox.label.split(props.hdelimiter).pop()
+}
+
+function setHover(mailbox, value) {
+  hoverStates.value[mailbox.name] = value
+}
+
+function getBackgroundColorClass(mailbox) {
+  if (model.value === mailbox.name) {
+    return `bg-primary-lighten-1`
+  }
+  if (!props.lightMode) {
+    return hoverStates.value[mailbox.name]
+      ? `bg-primary-lighten-1`
+      : `bg-primary`
+  }
+  return hoverStates.value[mailbox.name] ? 'bg-primary' : `bg-white`
+}
+
+function getMailboxState(mailbox) {
+  return mailboxStates.value[mailbox.name]
+}
+
+function toggleMailbox(mailbox) {
+  if (!mailboxStates.value[mailbox.name]) {
+    mailboxStates.value[mailbox.name] = false
+  }
+  mailboxStates.value[mailbox.name] = !mailboxStates.value[mailbox.name]
+  if (mailboxStates.value[mailbox.name] && !mailbox.sub.length) {
+    api.getUserMailboxes(mailbox.name).then((resp) => {
+      mailbox.sub = resp.data.mailboxes
+    })
+  }
+}
+
+function onClick(mailbox) {
+  if (isSharedContainer(mailbox)) {
+    toggleMailbox(mailbox)
+  } else {
+    updateSelection(mailbox.name)
+  }
+}
+
+function updateSelection(value) {
+  if (props.allowUnselect && value === model.value) {
+    emit('update:modelValue', null)
+  } else {
+    emit('update:modelValue', value)
+  }
+}
+
+async function onDrop(mailbox) {
+  if (isSharedContainer(mailbox)) {
+    return
+  }
+  try {
+    busStore.displayNotification({
+      msg: $gettext('Moving selection...'),
+      type: 'info',
+      timeout: -1,
+    })
+    const resp = await api.moveSelection(
+      route.query.mailbox || 'INBOX',
+      mailbox.name,
+      webmailStore.selection
+    )
+    webmailStore.listingKey++
+    webmailStore.selection = []
+  } finally {
+    busStore.hideNotification()
+  }
+}
+</script>
+
+<style scoped lang="scss">
+.mailbox {
+  cursor: pointer;
+  &:hover {
+    border-radius: 5px;
+  }
+
+  i {
+    pointer-events: none;
+  }
+  span {
+    pointer-events: none;
+  }
+}
+</style>

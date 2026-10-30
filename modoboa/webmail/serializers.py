@@ -1,0 +1,620 @@
+"""Webmail serializers."""
+
+import logging
+
+from django.utils.translation import gettext as _
+from django.utils import timezone
+
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
+
+from modoboa.admin import models as admin_models
+from modoboa.webmail import constants, models
+from modoboa.webmail.exceptions import ImapError
+from modoboa.webmail.lib import imapheader, signature
+from modoboa.webmail.lib.imaputils import get_imapconnector
+from modoboa.webmail.lib.utils import (
+    allowed_sender_addresses,
+    create_message,
+    message_copy,
+    parse_recipient,
+)
+
+logger = logging.getLogger("modoboa.webmail")
+
+
+class GlobalParametersSerializer(serializers.Serializer):
+    max_attachment_size = serializers.CharField(default="2048")
+    max_attachments_total_size = serializers.CharField(default="10M")
+    max_attachments_count = serializers.IntegerField(default=10, min_value=1)
+
+    imap_server = serializers.CharField(default="127.0.0.1")
+    imap_secured = serializers.BooleanField(default=False)
+    imap_port = serializers.IntegerField(default=143)
+
+    smtp_server = serializers.CharField(default="127.0.0.1")
+    smtp_secured_mode = serializers.ChoiceField(
+        default=constants.SmtpConnectionMode.NONE.value,
+        choices=constants.SMTP_CONNECTION_MODES,
+    )
+    smtp_port = serializers.IntegerField(default=25)
+    smtp_authentication = serializers.BooleanField(default=False)
+
+    scheduling_smtp_server = serializers.CharField(default="127.0.0.1")
+    scheduling_smtp_secured_mode = serializers.ChoiceField(
+        default=constants.SmtpConnectionMode.NONE.value,
+        choices=constants.SMTP_CONNECTION_MODES,
+    )
+    scheduling_smtp_port = serializers.IntegerField(default=25)
+
+
+class UserPreferencesSerializer(serializers.Serializer):
+    displaymode = serializers.ChoiceField(
+        default=constants.DisplayMode.PLAIN.value, choices=constants.DISPLAY_MODES
+    )
+    enable_links = serializers.BooleanField(default=False)
+    listing_mode = serializers.ChoiceField(
+        default=constants.ListingMode.FLAT.value, choices=constants.LISTING_MODES
+    )
+    messages_per_page = serializers.IntegerField(default=40)
+    refresh_interval = serializers.IntegerField(default=300)
+    trash_folder = serializers.CharField(default="Trash")
+    sent_folder = serializers.CharField(default="Sent")
+    drafts_folder = serializers.CharField(default="Drafts")
+    junk_folder = serializers.CharField(default="Junk")
+
+    editor = serializers.ChoiceField(
+        default=constants.DisplayMode.PLAIN.value, choices=constants.DISPLAY_MODES
+    )
+    signature = serializers.CharField(required=False)
+    # In replies and forwards
+    signature_position = serializers.ChoiceField(
+        default=constants.SignaturePosition.ABOVE.value,
+        choices=constants.SIGNATURE_POSITIONS,
+    )
+    # Seconds during which sending can be cancelled, 0 to send at once
+    undo_send_delay = serializers.IntegerField(default=10, min_value=0, max_value=30)
+
+
+class UserMailboxSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    path = serializers.CharField(required=False)
+    label = serializers.CharField()
+    type = serializers.ChoiceField(choices=constants.MAILBOX_TYPES)
+    # Address of the user sharing the folder
+    owner = serializers.CharField(required=False)
+    unseen = serializers.IntegerField(default=0)
+    removed = serializers.BooleanField(default=False)
+    # False for the levels of the shared namespace that hold no messages. An
+    # owner level is the shared INBOX when the user has rights on it.
+    selectable = serializers.BooleanField(default=True)
+    sub = serializers.SerializerMethodField()
+
+    def get_sub(self, obj):
+        if "sub" in obj:
+            return UserMailboxSerializer(obj["sub"], many=True).data
+        return None
+
+
+class SubscriptionSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    subscribed = serializers.BooleanField()
+
+
+class SubscriptionsSerializer(serializers.Serializer):
+    mailboxes = SubscriptionSerializer(many=True)
+    hdelimiter = serializers.CharField()
+
+
+class SubscriptionChangeSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    subscribed = serializers.BooleanField()
+
+
+class SubscriptionUpdateSerializer(serializers.Serializer):
+    changes = SubscriptionChangeSerializer(many=True)
+
+
+class UserMailboxQuotaSerializer(serializers.Serializer):
+    usage = serializers.IntegerField(source="quota_usage")
+    current = serializers.IntegerField(source="quota_current")
+    limit = serializers.IntegerField(source="quota_limit")
+
+
+class UserMailboxUnseenSerializer(serializers.Serializer):
+    counter = serializers.IntegerField()
+
+
+class UserMailboxStatusSerializer(serializers.Serializer):
+    state = serializers.CharField()
+    unseen = serializers.IntegerField()
+
+
+class UserMailboxesSerializer(serializers.Serializer):
+    mailboxes = UserMailboxSerializer(many=True)
+    hdelimiter = serializers.CharField()
+    sharing_enabled = serializers.BooleanField()
+
+
+class MailboxShareSerializer(serializers.Serializer):
+    grantee = serializers.CharField()
+    # A key of SHARING_LEVELS, or "custom" for rights set by another client
+    level = serializers.CharField()
+    rights = serializers.CharField()
+
+
+class MailboxSharesSerializer(serializers.Serializer):
+    mailbox = serializers.CharField()
+    shares = MailboxShareSerializer(many=True)
+
+
+class MailboxShareInputSerializer(serializers.Serializer):
+    mailbox = serializers.CharField()
+    grantee = serializers.CharField()
+    level = serializers.ChoiceField(choices=list(constants.SHARING_LEVELS))
+
+    def validate_grantee(self, value):
+        mailbox = self.context["request"].user.mailbox
+        candidates = admin_models.Mailbox.objects.get_share_candidates(mailbox)
+        if not candidates.filter(user__username=value).exists():
+            raise serializers.ValidationError(_("Unknown account"))
+        return value
+
+
+class MailboxShareDeleteSerializer(serializers.Serializer):
+    mailbox = serializers.CharField()
+    # Any identifier of the ACL, as returned by GET: it may have been set
+    # by another client. It is sent as a quoted string.
+    grantee = serializers.CharField(trim_whitespace=False)
+
+    def validate_grantee(self, value):
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            raise serializers.ValidationError(_("Invalid identifier"))
+        if value == self.context["request"].user.username:
+            raise serializers.ValidationError(_("You can't remove your own rights"))
+        return value
+
+
+class MailboxRightsSerializer(serializers.Serializer):
+    rights = serializers.CharField()
+
+
+class ShareCandidateSerializer(serializers.Serializer):
+    address = serializers.CharField(source="full_address")
+    name = serializers.CharField(source="user.fullname")
+
+
+class UserMailboxInputSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    # Top-level folders send an empty parent: accept it (treated as "no
+    # parent" by the viewsets) instead of rejecting it as blank.
+    parent_mailbox = serializers.CharField(required=False, allow_blank=True)
+
+
+class UserMailboxUpdateSerializer(UserMailboxInputSerializer):
+    oldname = serializers.CharField()
+
+
+class EmailAddressSerializer(serializers.Serializer):
+    fulladdress = serializers.CharField()
+    address = serializers.CharField()
+    name = serializers.CharField(required=False)
+    contact_id = serializers.IntegerField(required=False)
+
+
+class AttachmentSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    partnum = serializers.CharField()
+    # Encoded size in octets, as announced by the body structure
+    size = serializers.IntegerField(required=False)
+    content_type = serializers.CharField(required=False)
+
+
+class AttachmentUploadSerializer(serializers.Serializer):
+    attachment = serializers.FileField()
+
+
+class UploadedAttachmentSerializer(serializers.Serializer):
+    tmpname = serializers.CharField()
+    fname = serializers.CharField()
+    size = serializers.IntegerField(required=False)
+
+
+class EmailHeadersSerializer(serializers.Serializer):
+    imapid = serializers.CharField()
+    subject = serializers.SerializerMethodField()
+    from_address = serializers.SerializerMethodField()
+    recipients = serializers.SerializerMethodField()
+    date = serializers.SerializerMethodField()
+    size = serializers.IntegerField()
+    answered = serializers.BooleanField(default=False)
+    attachments = serializers.BooleanField(default=False)
+    forwarded = serializers.BooleanField(default=False)
+    flagged = serializers.BooleanField(default=False)
+    # Described from the body structure the listing already fetches, so
+    # a message can name its files without its body being loaded
+    attachment_list = AttachmentSerializer(many=True, required=False)
+    style = serializers.CharField(required=False)
+
+    scheduled_id = serializers.IntegerField(
+        source=constants.CUSTOM_HEADER_SCHEDULED_ID, required=False
+    )
+    scheduled_datetime = serializers.SerializerMethodField(required=False)
+    scheduled_datetime_raw = serializers.CharField(
+        source=constants.CUSTOM_HEADER_SCHEDULED_DATETIME, required=False
+    )
+
+    def get_subject(self, obj) -> str:
+        if "Subject" in obj:
+            return imapheader.parse_subject(obj["Subject"])
+        return ""
+
+    def get_from_address(self, obj):
+        if "From" in obj:
+            return imapheader.parse_address(obj["From"])
+        return ""
+
+    def get_recipients(self, obj):
+        if "To" in obj:
+            return imapheader.parse_address_list(obj["To"])
+        return ""
+
+    def get_date(self, obj) -> str:
+        if "Date" in obj:
+            return imapheader.parse_date(obj["Date"])
+        return ""
+
+    def get_scheduled_datetime(self, obj) -> str:
+        if constants.CUSTOM_HEADER_SCHEDULED_DATETIME in obj:
+            return imapheader.parse_scheduled_datetime(
+                obj[constants.CUSTOM_HEADER_SCHEDULED_DATETIME]
+            )
+        return ""
+
+
+class PaginatedEmailListSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    first_index = serializers.IntegerField()
+    last_index = serializers.IntegerField()
+    prev_page = serializers.IntegerField()
+    next_page = serializers.IntegerField()
+    # See UserMailboxViewSet.status
+    state = serializers.CharField(allow_null=True)
+    unseen = serializers.IntegerField(allow_null=True)
+    results = EmailHeadersSerializer(many=True)
+
+
+class ThreadSummarySerializer(serializers.Serializer):
+    """A conversation, as displayed in the messages list."""
+
+    root = serializers.CharField()
+    latest = EmailHeadersSerializer()
+    subject = serializers.SerializerMethodField()
+    count = serializers.IntegerField()
+    unseen_count = serializers.IntegerField()
+    flagged = serializers.BooleanField(default=False)
+    attachments = serializers.BooleanField(default=False)
+    participants = EmailAddressSerializer(many=True)
+    uids = serializers.ListField(child=serializers.CharField())
+
+    def get_subject(self, obj) -> str:
+        return imapheader.parse_subject(obj["subject"]) if obj["subject"] else ""
+
+
+class PaginatedThreadListSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    first_index = serializers.IntegerField()
+    last_index = serializers.IntegerField()
+    prev_page = serializers.IntegerField()
+    next_page = serializers.IntegerField()
+    threading_supported = serializers.BooleanField()
+    # See UserMailboxViewSet.status
+    state = serializers.CharField(allow_null=True)
+    unseen = serializers.IntegerField(allow_null=True)
+    results = ThreadSummarySerializer(many=True)
+
+
+class ThreadSerializer(serializers.Serializer):
+    """The messages of a single conversation."""
+
+    threading_supported = serializers.BooleanField()
+    results = EmailHeadersSerializer(many=True)
+
+
+class EmailSerializer(serializers.Serializer):
+    subject = serializers.CharField()
+    from_address = EmailAddressSerializer(source="From")
+    to = EmailAddressSerializer(source="To", many=True)
+    cc = EmailAddressSerializer(source="Cc", many=True, required=False)
+    bcc = EmailAddressSerializer(source="Bcc", many=True, required=False)
+    body = serializers.CharField()
+    # Format of the returned body (plain or html)
+    body_format = serializers.CharField(source="mformat", required=False)
+    date = serializers.CharField(source="Date")
+    # The date in full, where the compact one above leaves parts out
+    date_full = serializers.CharField(source="Date_full", required=False)
+    message_id = serializers.CharField(source="Message_ID", required=False)
+    in_reply_to = serializers.CharField(source="In_Reply_To", required=False)
+    references = serializers.CharField(source="References", required=False)
+    # Reply-To may contain several addresses (parsed as a list)
+    reply_to = EmailAddressSerializer(source="Reply_To", many=True, required=False)
+    attachments = serializers.SerializerMethodField()
+    # Remote images and other resources were dropped from the body: the
+    # reader can ask for them
+    remote_content_blocked = serializers.BooleanField(read_only=True)
+
+    scheduled_datetime = serializers.DateTimeField(
+        source=constants.CUSTOM_HEADER_SCHEDULED_DATETIME.replace("-", "_"),
+        required=False,
+    )
+
+    @extend_schema_field(AttachmentSerializer(many=True))
+    def get_attachments(self, email):
+        result = []
+        if email.attachments:
+            for partnum, attachment in email.attachments.items():
+                result.append({"partnum": partnum, **attachment})
+        return result
+
+
+class MoveSelectionSerializer(serializers.Serializer):
+    source = serializers.CharField()
+    destination = serializers.CharField(required=False)
+    selection = serializers.ListField(child=serializers.CharField())
+
+    def validate_source(self, value):
+        if value == constants.MAILBOX_NAME_SCHEDULED:
+            raise serializers.ValidationError(
+                _("Moving scheduled messages is forbidden")
+            )
+        return value
+
+    def validate_selection(self, value):
+        return [item for item in value if item.isdigit()]
+
+
+class FlagSelectionSerializer(serializers.Serializer):
+    mailbox = serializers.CharField()
+    selection = serializers.ListField(child=serializers.CharField())
+    status = serializers.ChoiceField(
+        choices=[
+            ("read", "Read"),
+            ("unread", "Unread"),
+            ("flagged", "Flagged"),
+            ("unflagged", "Unflagged"),
+        ]
+    )
+
+    def validate_selection(self, value):
+        return [item for item in value if item.isdigit()]
+
+
+class ScheduledDatetimeMixin:
+    """Mixin to inject scheduled_datetime logic into a serializer."""
+
+    scheduled_datetime = serializers.DateTimeField(required=False)
+
+    def validate_scheduled_datetime(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError(
+                _("Only datetime in the future is allowed")
+            )
+        delta = value - timezone.now()
+        if delta.total_seconds() < 60:
+            raise serializers.ValidationError(
+                _("Provived datetime must be one minute in the future at least")
+            )
+        return value
+
+
+class BaseEmailSerializer(serializers.Serializer):
+    sender = serializers.EmailField()
+    subject = serializers.CharField(required=False)
+    body = serializers.CharField(required=False)
+    # Recipients: "address" or "Name <address>"
+    to = serializers.ListField(child=serializers.CharField(), required=False)
+    cc = serializers.ListField(child=serializers.CharField(), required=False)
+    bcc = serializers.ListField(child=serializers.CharField(), required=False)
+    # Message this one replies to, kept in drafts
+    in_reply_to = serializers.CharField(required=False)
+    # References of the message this one replies to
+    references = serializers.CharField(required=False)
+    # Format chosen in the editor; the "editor" preference applies otherwise
+    body_format = serializers.ChoiceField(
+        choices=constants.DISPLAY_MODES, required=False
+    )
+
+    def validate_sender(self, value):
+        """Ensure the sender is an address the user is allowed to use.
+
+        Without this check a user could send with an arbitrary From address
+        (identity spoofing).
+        """
+        user = self.context["request"].user
+        if value.lower() not in allowed_sender_addresses(user):
+            raise serializers.ValidationError(
+                _("You are not allowed to send from this address")
+            )
+        return value
+
+    def _validate_recipients(self, value):
+        result = []
+        invalid = []
+        for item in value:
+            recipient = parse_recipient(item)
+            if recipient is None:
+                invalid.append(item)
+            else:
+                result.append(recipient)
+        if invalid:
+            raise serializers.ValidationError(
+                _("Invalid addresses: %s") % ", ".join(invalid)
+            )
+        return result
+
+    def validate_to(self, value):
+        return self._validate_recipients(value)
+
+    def validate_cc(self, value):
+        return self._validate_recipients(value)
+
+    def validate_bcc(self, value):
+        return self._validate_recipients(value)
+
+
+class SendEmailSerializer(ScheduledDatetimeMixin, BaseEmailSerializer):
+    scheduled_datetime = serializers.DateTimeField(required=False)
+    request_dsn = serializers.BooleanField(required=False, default=False)
+    request_mdn = serializers.BooleanField(required=False, default=False)
+    # UID of the draft this message comes from (deleted once sent)
+    mailid = serializers.IntegerField(required=False)
+    # Message this one replies to or forwards (flagged once sent)
+    original_mailbox = serializers.CharField(required=False)
+    original_mailid = serializers.IntegerField(required=False, min_value=1)
+    original_action = serializers.ChoiceField(
+        choices=["reply", "forward"], required=False
+    )
+
+    ORIGINAL_MESSAGE_FIELDS = ("original_mailbox", "original_mailid", "original_action")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["to"].required = True
+
+    def validate(self, data):
+        data = super().validate(data)
+        if data.get("scheduled_datetime"):
+            self.validate_scheduled_message_lengths(data)
+        provided = [name for name in self.ORIGINAL_MESSAGE_FIELDS if name in data]
+        if provided and len(provided) != len(self.ORIGINAL_MESSAGE_FIELDS):
+            raise serializers.ValidationError(
+                _(
+                    "original_mailbox, original_mailid and original_action "
+                    "must be provided together"
+                )
+            )
+        return data
+
+    def validate_scheduled_message_lengths(self, data):
+        """Ensure a scheduled message fits in the database columns.
+
+        A message sent right away has no such limit, but a scheduled one is
+        stored first: a too long value would make the database fail.
+        """
+        errors = {}
+        for name in ("subject", "in_reply_to"):
+            max_length = models.ScheduledMessage._meta.get_field(name).max_length
+            if len(data.get(name) or "") > max_length:
+                errors[name] = _(
+                    "Ensure this field has no more than %(max_length)s "
+                    "characters to schedule the message"
+                ) % {"max_length": max_length}
+        if errors:
+            raise serializers.ValidationError(errors)
+
+
+class SaveEmailSerializer(BaseEmailSerializer):
+    mailid = serializers.IntegerField(required=False)
+
+    def create(self, validated_data):
+        message = create_message(
+            self.context["request"].user, validated_data, self.context["attachments"]
+        )
+        drafts_folder = self.context["request"].user.parameters.get_value(
+            "drafts_folder"
+        )
+        # Bcc is kept so that it is not lost when the draft is reopened
+        mime_message = message_copy(message)
+        with get_imapconnector(self.context["request"]) as imapc:
+            mailid = imapc.push_mail(drafts_folder, mime_message)
+            imapc.mark_messages_unread(drafts_folder, [str(mailid)])
+            # The previous version goes only once the new one is stored: a
+            # failure must not lose the draft
+            if "mailid" in validated_data:
+                try:
+                    imapc.delete_mail(drafts_folder, validated_data["mailid"])
+                except ImapError:
+                    # A leftover copy is better than a lost draft
+                    logger.exception("Failed to remove the previous draft version")
+            return mailid
+
+
+class ComposeSessionSerializer(serializers.Serializer):
+    attachments = UploadedAttachmentSerializer(many=True, required=False)
+    uid = serializers.CharField()
+    signature = serializers.SerializerMethodField()
+    signature_position = serializers.SerializerMethodField()
+    editor_format = serializers.SerializerMethodField()
+    undo_send_delay = serializers.SerializerMethodField()
+
+    def get_undo_send_delay(self, obj) -> int:
+        return self.context["request"].user.parameters.get_value("undo_send_delay")
+
+    def get_editor_format(self, obj):
+        return self.context["request"].user.parameters.get_value("editor")
+
+    def get_signature_position(self, obj):
+        return self.context["request"].user.parameters.get_value("signature_position")
+
+    def get_signature(self, obj):
+        return str(signature.EmailSignature(self.context["request"].user))
+
+
+class ConvertBodySerializer(serializers.Serializer):
+    """Body to convert when the format of the editor changes."""
+
+    body = serializers.CharField(allow_blank=True, trim_whitespace=False)
+    source_format = serializers.ChoiceField(choices=constants.DISPLAY_MODES)
+    target_format = serializers.ChoiceField(choices=constants.DISPLAY_MODES)
+
+
+class CreateSessionSerializer(serializers.Serializer):
+    # Draft being edited: its attachments are copied into the session
+    from_draft_message = serializers.IntegerField(required=False)
+    # Message being forwarded: its attachments are copied too
+    forward_mailbox = serializers.CharField(required=False)
+    forward_mailid = serializers.IntegerField(required=False, min_value=1)
+
+    def validate(self, data):
+        data = super().validate(data)
+        forward_fields = [
+            name for name in ("forward_mailbox", "forward_mailid") if name in data
+        ]
+        if len(forward_fields) == 1:
+            raise serializers.ValidationError(
+                _("forward_mailbox and forward_mailid must be provided together")
+            )
+        if forward_fields and "from_draft_message" in data:
+            raise serializers.ValidationError(
+                _("A session can't start from a draft and a forwarded message")
+            )
+        return data
+
+
+class AllowedSenderSerializer(serializers.Serializer):
+    address = serializers.EmailField()
+
+
+class ScheduledMessageSerializer(ScheduledDatetimeMixin, serializers.ModelSerializer):
+    class Meta:
+        model = models.ScheduledMessage
+        fields = ["error", "scheduled_datetime"]
+        read_only_fields = ["error"]
+
+    def update(self, instance, validated_data):
+        if instance.status == constants.SchedulingState.SEND_ERROR.value:
+            # Rescheduling a failed message gives it another try
+            instance.status = constants.SchedulingState.SCHEDULED.value
+            instance.error = None
+        instance = super().update(instance, validated_data)
+        message = instance.to_email_message()
+        with get_imapconnector(self.context["request"]) as imapc:
+            if instance.imap_uid:
+                # No IMAP copy (it failed, or the folder was cleaned up):
+                # rescheduling must still work.
+                imapc.delete_mail(constants.MAILBOX_NAME_SCHEDULED, instance.imap_uid)
+            instance.imap_uid = imapc.push_mail(
+                constants.MAILBOX_NAME_SCHEDULED, message_copy(message)
+            )
+            instance.save()
+        return instance

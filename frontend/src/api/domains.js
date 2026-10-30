@@ -1,0 +1,96 @@
+import repository from './repository'
+
+const domainResource = 'domains'
+const domainAliasResource = 'domainaliases'
+
+export default {
+  getDomains(params) {
+    return repository.get(`/${domainResource}/`, { params })
+  },
+  async getAllDomains(params = {}) {
+    // The API is always paginated, so walk through every page
+    const results = []
+    let page = 1
+    while (true) {
+      const resp = await repository.get(`/${domainResource}/`, {
+        params: { page_size: 100, ...params, page },
+      })
+      results.push(...resp.data.results)
+      if (!resp.data.next) {
+        return results
+      }
+      page += 1
+    }
+  },
+  getDomain(domainId) {
+    return repository.get(`/${domainResource}/${domainId}/`)
+  },
+  getDomainDNSDetail(domainId) {
+    return repository.get(`/${domainResource}/${domainId}/dns_detail/`)
+  },
+  getDomainDmarcAlignment(domainId, period) {
+    return repository.get(
+      `${domainResource}/${domainId}/dmarc/alignment_stats/`,
+      { params: { period } }
+    )
+  },
+  getDomainAliases(domain) {
+    let url = `/${domainAliasResource}/`
+    if (domain !== undefined) {
+      url += `?domain=${domain}`
+    }
+    return repository.get(url)
+  },
+  getDomainAdministrators(domainId) {
+    return repository.get(`/${domainResource}/${domainId}/administrators/`)
+  },
+  addDomainAdministrator(domainId, accountId) {
+    return repository.post(
+      `/${domainResource}/${domainId}/administrators/add/`,
+      { account: accountId }
+    )
+  },
+  removeDomainAdministrator(domainId, accountId) {
+    return repository.post(
+      `/${domainResource}/${domainId}/administrators/remove/`,
+      { account: accountId }
+    )
+  },
+  createDomain(data) {
+    return repository.post(`/${domainResource}/`, data)
+  },
+  updateDomain(domainId, data) {
+    return repository.put(`/${domainResource}/${domainId}/`, data)
+  },
+  patchDomain(domainId, data) {
+    return repository.patch(`/${domainResource}/${domainId}/`, data)
+  },
+  generateDKIMKey(domainId) {
+    return repository.post(`/${domainResource}/${domainId}/dkim/generate/`)
+  },
+  deleteDomain(domainId, data) {
+    return repository.post(`/${domainResource}/${domainId}/delete/`, data)
+  },
+  bulkDeleteDomains(data) {
+    return repository.post(`/${domainResource}/bulk_delete/`, data)
+  },
+  createDomainAlias(data) {
+    return repository.post(`/${domainAliasResource}/`, data)
+  },
+  updateDomainAlias(aliasId, data) {
+    return repository.put(`/${domainAliasResource}/${aliasId}/`, data)
+  },
+  deleteDomainAlias(aliasId) {
+    return repository.delete(`/${domainAliasResource}/${aliasId}/`)
+  },
+  exportAll() {
+    return repository.get(`/${domainResource}/export/`)
+  },
+  importFromCSV(data) {
+    return repository.post(`/${domainResource}/import/`, data, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    })
+  },
+}

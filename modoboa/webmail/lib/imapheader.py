@@ -1,0 +1,206 @@
+"""Set of functions used to parse and transform email headers."""
+
+import datetime
+import email
+
+from charset_normalizer import detect as charset_detect
+
+from django.utils import timezone
+from django.utils.formats import date_format
+
+from modoboa.lib.email_utils import EmailAddress
+from modoboa.lib.signals import get_request
+
+__all__ = [
+    "parse_from",
+    "parse_to",
+    "parse_message_id",
+    "parse_in_reply_to",
+    "parse_references",
+    "parse_date",
+    "parse_reply_to",
+    "parse_cc",
+    "parse_bcc",
+    "parse_subject",
+]
+
+# date and time formats for email list
+# according to https://en.wikipedia.org/wiki/Date_format_by_country
+# and https://en.wikipedia.org/wiki/Date_and_time_representation_by_country
+DATETIME_FORMATS = {
+    "cs": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "de": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "en": {"SHORT": "l, P", "LONG": "N j, Y P", "TIME": "H:i", "CLOCK": "P"},
+    "es": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "fr": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "it": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "ja_JP": {"SHORT": "l, P", "LONG": "N j, Y P", "TIME": "H:i", "CLOCK": "P"},
+    "nl": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "pl_PL": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "pt_PT": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "pt_BR": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "ru": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+    "sv": {"SHORT": "l, H:i", "LONG": "d. N Y H:i", "TIME": "H:i", "CLOCK": "H:i"},
+}
+
+
+def to_unicode(value):
+    """Try to convert a string to unicode.
+
+    Accept ``str`` or ``bytes``. ``bytes`` values are decoded using
+    UTF‑8 (with charset detection fallback).
+    """
+    if value is None or isinstance(value, str):
+        return value
+
+    try:
+        value = value.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    else:
+        return value
+    try:
+        res = charset_detect(value)
+    except UnicodeDecodeError:
+        return value
+    if res["encoding"] == "ascii":
+        return value
+    return value.decode(res["encoding"])
+
+
+def parse_address(value: str) -> dict:
+    """Parse an email address."""
+    addr = EmailAddress(value)
+    result = {
+        "fulladdress": to_unicode(addr.fulladdress),
+        "address": to_unicode(addr.address),
+    }
+    if addr.name:
+        result["name"] = to_unicode(addr.name)
+    return result
+
+
+def parse_address_list(values: str) -> list[dict]:
+    """Parse a list of email addresses.
+
+    Display names may contain commas (``"Doe, John" <john@example.com>``,
+    common with Outlook): the list is split according to the address
+    syntax, not on every comma.
+    """
+    result = []
+    for name, address in email.utils.getaddresses([values]):
+        if not name and not address:
+            continue
+        result.append(parse_address(email.utils.formataddr((name, address))))
+    return result
+
+
+def parse_from(value):
+    """Parse a From: header."""
+    return parse_address(value)
+
+
+def parse_to(value):
+    """Parse a To: header."""
+    return parse_address_list(value)
+
+
+def parse_cc(value):
+    """Parse a Cc: header."""
+    return parse_address_list(value)
+
+
+def parse_bcc(value):
+    """Parse a Bcc: header."""
+    return parse_address_list(value)
+
+
+def parse_reply_to(value):
+    """Parse a Reply-To: header."""
+    return parse_address_list(value)
+
+
+def compact_date_format(ndate, language: str) -> str:
+    """Pick the shortest format that still identifies a message date.
+
+    The listing shows one date per row in a narrow column, so it only
+    carries what tells messages apart: the time for today, the weekday
+    and the time for the last week, then the day and the month, and the
+    year only when it is not the current one.
+    """
+    formats = DATETIME_FORMATS.get(language, DATETIME_FORMATS["en"])
+    now = timezone.localtime()
+    if ndate.date() == now.date():
+        return formats["CLOCK"]
+    if now - ndate < datetime.timedelta(days=7):
+        return f"D {formats['CLOCK']}"
+    if ndate.year == now.year:
+        return "j M"
+    return "j M Y"
+
+
+def _local_date(value) -> datetime.datetime | None:
+    """Read a Date: header in the current time zone, whatever the sender's one."""
+    tmp = email.utils.parsedate_tz(value)
+    if not tmp:
+        return None
+    return datetime.datetime.fromtimestamp(
+        email.utils.mktime_tz(tmp), tz=timezone.get_current_timezone()
+    )
+
+
+def parse_date(value, **kwargs):
+    """Parse a Date: header."""
+    ndate = _local_date(value)
+    if ndate is None:
+        return value
+    return date_format(ndate, compact_date_format(ndate, get_request().user.language))
+
+
+def format_full_date(value) -> str:
+    """Format a Date: header in full, the compact form leaving parts out."""
+    ndate = _local_date(value)
+    if ndate is None:
+        return value
+    return date_format(ndate, "DATETIME_FORMAT")
+
+
+def parse_scheduled_datetime(value: str, **kwargs) -> str:
+    result = datetime.datetime.fromisoformat(value)
+    if timezone.is_naive(result):
+        result = timezone.make_aware(result)
+    result = timezone.localtime(result)
+    current_language = get_request().user.language
+    if timezone.localdate() != result.date():
+        fmt = "LONG"
+    else:
+        fmt = "TIME"
+    return date_format(
+        result, DATETIME_FORMATS.get(current_language, DATETIME_FORMATS.get("en"))[fmt]
+    )
+
+
+def parse_message_id(value, **kwargs):
+    """Parse a Message-ID: header."""
+    return value.strip("\n")
+
+
+def parse_in_reply_to(value, **kwargs):
+    """Parse an In-Reply-To: header."""
+    return value.strip()
+
+
+def parse_references(value, **kwargs):
+    """Parse a References: header, unfolding its lines."""
+    return " ".join(value.split())
+
+
+def parse_subject(value, **kwargs):
+    """Parse a Subject: header."""
+    from modoboa.lib import u2u_decode
+
+    try:
+        subject = u2u_decode.u2u_decode(value)
+    except UnicodeDecodeError:
+        subject = value
+    return to_unicode(subject)

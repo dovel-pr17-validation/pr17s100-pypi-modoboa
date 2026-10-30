@@ -1,0 +1,872 @@
+<template>
+  <div style="display: grid; grid-template-rows: auto auto 1fr; height: 96vh">
+    <div class="text-headline-medium ml-4 mb-6">
+      {{ $gettext('Calendar') }}
+    </div>
+
+    <v-toolbar v-if="calendarRef" color="white" flat>
+      <v-btn
+        class="me-4"
+        color="grey-darken-2"
+        variant="outlined"
+        @click="setToday"
+      >
+        {{ $gettext('Today') }}
+      </v-btn>
+      <v-btn
+        color="grey-darken-2"
+        size="small"
+        variant="text"
+        icon
+        @click="goPrev"
+      >
+        <v-icon size="small"> mdi-chevron-left </v-icon>
+      </v-btn>
+      <v-btn
+        color="grey-darken-2"
+        size="small"
+        variant="text"
+        icon
+        @click="goNext"
+      >
+        <v-icon size="small"> mdi-chevron-right </v-icon>
+      </v-btn>
+      <v-toolbar-title>
+        {{ calendarRef.title }}
+      </v-toolbar-title>
+      <v-menu location="bottom end">
+        <template #activator="{ props }">
+          <v-btn color="grey-darken-2" variant="outlined" v-bind="props">
+            <span>{{ typeToLabel[ctype] }}</span>
+            <v-icon end> mdi-menu-down </v-icon>
+          </v-btn>
+        </template>
+        <v-list>
+          <v-list-item @click="ctype = 'day'">
+            <v-list-item-title>{{ $gettext('Day') }}</v-list-item-title>
+          </v-list-item>
+          <v-list-item @click="ctype = 'week'">
+            <v-list-item-title>{{ $gettext('Week') }}</v-list-item-title>
+          </v-list-item>
+          <v-list-item @click="ctype = 'month'">
+            <v-list-item-title>{{ $gettext('Month') }}</v-list-item-title>
+          </v-list-item>
+        </v-list>
+      </v-menu>
+    </v-toolbar>
+
+    <div ref="calendarContainer" style="overflow: auto">
+      <v-calendar
+        ref="calendarRef"
+        v-model="focus"
+        :events="events"
+        first-day-of-week="1"
+        :type="ctype"
+        :locale="current"
+        event-name="title"
+        :event-color="getEventColor"
+        :event-ripple="false"
+        :interval-height="INTERVAL_HEIGHT"
+        :interval-style="getIntervalStyle"
+        @mousedown:event="startDrag"
+        @mousedown:time="startTime"
+        @mousedown:day="startDay"
+        @click:day="dayClickCallback"
+        @mouseleave="cancelDrag"
+        @mousemove:time="mouseMove"
+        @mousemove:day="mouseMoveDay"
+        @mouseup:time="endDrag"
+        @mouseup:day="endDragDay"
+        @change="fetchUserEvents"
+      >
+        <template #event="{ event, timed, eventSummary }">
+          <div class="v-event-draggable">
+            <component :is="eventSummary"></component>
+          </div>
+          <div
+            v-if="timed && event.editable"
+            class="v-event-drag-bottom"
+            @mousedown.stop="extendBottom(event)"
+          ></div>
+        </template>
+      </v-calendar>
+    </div>
+
+    <v-dialog v-model="showInformation" persistent max-width="800px">
+      <CalendarDetail :calendar="selectedCalendar" @close="closeInformation" />
+    </v-dialog>
+    <v-dialog v-model="showCalendarForm" persistent max-width="800px">
+      <CalendarForm
+        :initial-calendar="selectedCalendar"
+        @color-changed="refreshCalendarEvents"
+        @close="closeCalendarForm"
+      />
+    </v-dialog>
+    <v-dialog v-model="showEventForm" persistent max-width="800px">
+      <EventForm
+        :info="selectInfo"
+        :event="selectedEvent"
+        :calendars="calendars"
+        @refresh-calendar="refreshCalendarEvents"
+        @close="closeEventForm"
+      />
+    </v-dialog>
+    <v-dialog v-model="showAccessRulesForm" persistent max-width="800px">
+      <CalendarAccessRulesForm
+        v-if="selectedCalendar"
+        :calendar-pk="selectedCalendar.pk"
+        @close="closeAccessRulesForm"
+      />
+    </v-dialog>
+    <v-dialog v-model="showSharedWithMeColorForm" persistent max-width="800px">
+      <SharedWithMeCalendarForm
+        v-if="selectedCalendar"
+        :calendar="selectedCalendar"
+        @color-changed="refreshCalendars"
+        @close="closeSharedWithMeColorForm"
+      />
+    </v-dialog>
+    <v-dialog v-model="showSubscriptionForm" persistent max-width="800px">
+      <CalendarSubscriptionForm
+        v-if="showSubscriptionForm"
+        :initial-subscription="selectedSubscription"
+        @close="closeSubscriptionForm"
+      />
+    </v-dialog>
+    <v-dialog v-model="showImportEventsForm" persistent max-width="800px">
+      <ImportEventsForm
+        v-if="selectedCalendar"
+        :calendar="selectedCalendar"
+        @events-imported="refreshCalendarEvents"
+        @close="closeImportEventsForm"
+      />
+    </v-dialog>
+    <ConfirmDialog ref="confirm" />
+    <RecurrenceScopeDialog ref="scopeDialog" />
+  </div>
+</template>
+
+<script setup>
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useGettext } from 'vue3-gettext'
+import { useLayoutStore } from '@/stores'
+import { useBusStore } from '@/stores'
+import { DateTime } from 'luxon'
+import api from '@/api/calendars'
+import parametersApi from '@/api/parameters'
+import CalendarAccessRulesForm from '@/components/calendars/CalendarAccessRulesForm'
+import CalendarForm from '@/components/calendars/CalendarForm'
+import CalendarSubscriptionForm from '@/components/calendars/CalendarSubscriptionForm'
+import CalendarDetail from '@/components/calendars/CalendarDetail'
+import ConfirmDialog from '@/components/tools/ConfirmDialog'
+import EventForm from '@/components/calendars/EventForm'
+import ImportEventsForm from '@/components/calendars/ImportEventsForm'
+import RecurrenceScopeDialog from '@/components/calendars/RecurrenceScopeDialog'
+import SharedWithMeCalendarForm from '@/components/calendars/SharedWithMeCalendarForm'
+
+const { $gettext, current } = useGettext()
+const layoutStore = useLayoutStore()
+const busStore = useBusStore()
+
+const INTERVAL_HEIGHT = 48
+const WEEKEND_DAYS = [0, 6]
+
+const calendarRef = ref()
+const calendarContainer = ref()
+const confirm = ref()
+const scopeDialog = ref()
+const events = ref([])
+const selectInfo = ref()
+const selectedCalendar = ref(null)
+const selectedEvent = ref(null)
+const userCalendars = ref([])
+const sharedWithMeCalendars = ref([])
+const subscriptions = ref([])
+const selectedSubscription = ref(null)
+const showSubscriptionForm = ref(false)
+const showAccessRulesForm = ref(false)
+const showCalendarForm = ref(false)
+const showInformation = ref(false)
+const showEventForm = ref(false)
+const showImportEventsForm = ref(false)
+const showSharedWithMeColorForm = ref(false)
+const ctype = ref('week')
+const focus = ref('')
+const dragEvent = ref(null)
+const dragTime = ref(null)
+const dragDay = ref(null)
+const createEvent = ref(null)
+const createStart = ref(null)
+const extendOriginal = ref(null)
+const updating = ref(false)
+const moving = ref(false)
+const preferences = ref({ working_hours_start: 9, working_hours_end: 18 })
+
+const typeToLabel = {
+  day: $gettext('Day'),
+  week: $gettext('Week'),
+  month: $gettext('Month'),
+}
+
+// Calendars whose events are displayed
+const calendars = computed(() => [
+  ...userCalendars.value.map((calendar) => ({ ...calendar, write: true })),
+  ...sharedWithMeCalendars.value,
+  // Subscriptions don't share the pk space of calendars, hence the prefix
+  ...subscriptions.value.map((subscription) => ({
+    ...subscription,
+    pk: `subscription-${subscription.pk}`,
+    subscription: subscription.pk,
+    write: false,
+  })),
+])
+
+const leftMenuItems = computed(() => {
+  const result = [
+    {
+      icon: 'mdi-plus',
+      text: $gettext('New calendar'),
+      action: openCalendarForm,
+    },
+    {
+      icon: 'mdi-calendar-sync-outline',
+      text: $gettext('Subscribe to a calendar'),
+      action: () => openSubscriptionForm(null),
+    },
+    {
+      text: $gettext('My calendars'),
+      subheader: true,
+    },
+  ]
+  for (const calendar of userCalendars.value) {
+    result.push({
+      key: `calendar-${calendar.pk}`,
+      text: calendar.name,
+      children: [
+        {
+          text: $gettext('Information'),
+          icon: 'mdi-information-outline',
+          action: () => openInformation(calendar),
+        },
+        {
+          text: $gettext('Edit'),
+          icon: 'mdi-pencil',
+          action: () => editCalendar(calendar),
+        },
+        {
+          text: $gettext('Access rules'),
+          icon: 'mdi-filter-outline',
+          action: () => openAccessRulesForm(calendar),
+        },
+        {
+          text: $gettext('Delete'),
+          icon: 'mdi-trash-can-outline',
+          action: () => deleteCalendar(calendar.pk),
+        },
+        {
+          text: $gettext('Import'),
+          icon: 'mdi-calendar-import-outline',
+          action: () => openImportEventsForm(calendar),
+        },
+      ],
+    })
+  }
+  if (sharedWithMeCalendars.value.length) {
+    result.push({
+      text: $gettext('Shared with me'),
+      subheader: true,
+    })
+  }
+  for (const calendar of sharedWithMeCalendars.value) {
+    const children = [
+      {
+        text: $gettext('Information'),
+        icon: 'mdi-information-outline',
+        action: () => openInformation(calendar),
+      },
+      calendar.visible
+        ? {
+            text: $gettext('Hide'),
+            icon: 'mdi-eye-off-outline',
+            action: () => setCalendarVisibility(calendar, false),
+          }
+        : {
+            text: $gettext('Show'),
+            icon: 'mdi-eye-outline',
+            action: () => setCalendarVisibility(calendar, true),
+          },
+      {
+        text: $gettext('Color'),
+        icon: 'mdi-palette-outline',
+        action: () => openSharedWithMeColorForm(calendar),
+      },
+    ]
+    if (calendar.write) {
+      children.push({
+        text: $gettext('Import'),
+        icon: 'mdi-calendar-import-outline',
+        action: () => openImportEventsForm(calendar),
+      })
+    }
+    result.push({
+      key: `shared-with-me-${calendar.pk}`,
+      text: calendar.name,
+      subtitle: calendar.visible
+        ? calendar.owner
+        : `${calendar.owner} · ${$gettext('hidden')}`,
+      children,
+    })
+  }
+  if (subscriptions.value.length) {
+    result.push({
+      text: $gettext('Subscriptions'),
+      subheader: true,
+    })
+  }
+  for (const subscription of subscriptions.value) {
+    result.push({
+      key: `subscription-${subscription.pk}`,
+      text: subscription.name,
+      children: [
+        {
+          text: $gettext('Edit'),
+          icon: 'mdi-pencil',
+          action: () => openSubscriptionForm(subscription),
+        },
+        {
+          text: $gettext('Delete'),
+          icon: 'mdi-trash-can-outline',
+          action: () => deleteSubscription(subscription.pk),
+        },
+      ],
+    })
+  }
+  return result
+})
+
+let fetchEventsCounter = 0
+
+async function fetchUserEvents({ start, end }) {
+  const fetchId = ++fetchEventsCounter
+  const fetchedCalendars = calendars.value.filter(
+    (calendar) => calendar.visible !== false
+  )
+  // A calendar can fail (e.g. an access rule removed in the meantime)
+  // without preventing the display of the others
+  const results = await Promise.allSettled(
+    fetchedCalendars.map((calendar) =>
+      calendar.subscription
+        ? api.getCalendarSubscriptionEvents(
+            calendar.subscription,
+            { start: start.date, end: end.date },
+            { ignoreErrors: true }
+          )
+        : api.getUserCalendarEvents(
+            calendar.pk,
+            { start: start.date, end: end.date },
+            { ignoreErrors: true }
+          )
+    )
+  )
+  if (fetchId !== fetchEventsCounter) {
+    // A more recent fetch has been triggered (e.g. fast navigation)
+    return
+  }
+  const newEvents = []
+  const failedCalendars = []
+  results.forEach((result, index) => {
+    const calendar = fetchedCalendars[index]
+    if (result.status === 'rejected') {
+      failedCalendars.push(calendar.name)
+      return
+    }
+    for (const event of result.value.data) {
+      newEvents.push({
+        ...event,
+        // The color of a calendar shared with the user is chosen by them
+        color: calendar.owner ? calendar.color : event.color,
+        start: Date.parse(event.start),
+        end: Date.parse(event.end),
+        timed: !event.allDay,
+        editable: calendar.write,
+        owner: calendar.owner,
+        ...(calendar.subscription && {
+          calendar: { pk: calendar.pk },
+          subscription: true,
+        }),
+      })
+    }
+  })
+  events.value = newEvents
+  if (failedCalendars.length) {
+    busStore.displayNotification({
+      msg: $gettext('Unable to load the events of: %{ names }', {
+        names: failedCalendars.join(', '),
+      }),
+      type: 'error',
+    })
+  }
+}
+
+const getIntervalStyle = (interval) => {
+  if (
+    !WEEKEND_DAYS.includes(interval.weekday) &&
+    interval.hour >= preferences.value.working_hours_start &&
+    interval.hour < preferences.value.working_hours_end
+  ) {
+    return undefined
+  }
+  return { backgroundColor: 'rgba(var(--v-theme-on-surface), 0.05)' }
+}
+
+const scrollToWorkingHours = () => {
+  // VCalendar.scrollToTime() is not usable here: the root component
+  // exposes its own implementation, which is not bound to the
+  // scroll area rendered by the daily view.
+  const scrollArea = calendarContainer.value?.querySelector(
+    '.v-calendar-daily__scroll-area'
+  )
+  if (scrollArea) {
+    scrollArea.scrollTop =
+      preferences.value.working_hours_start * INTERVAL_HEIGHT
+  }
+}
+
+const setToday = () => {
+  focus.value = ''
+}
+
+const goPrev = () => {
+  calendarRef.value.prev()
+}
+
+const goNext = () => {
+  calendarRef.value.next()
+}
+
+function openCalendarForm() {
+  showCalendarForm.value = true
+}
+
+function closeCalendarForm() {
+  selectedCalendar.value = null
+  showCalendarForm.value = false
+  fetchUserCalendars()
+}
+
+function openInformation(calendar) {
+  selectedCalendar.value = calendar
+  showInformation.value = true
+}
+
+function closeInformation() {
+  selectedCalendar.value = null
+  showInformation.value = false
+}
+
+function openAccessRulesForm(calendar) {
+  selectedCalendar.value = calendar
+  showAccessRulesForm.value = true
+}
+
+function closeAccessRulesForm() {
+  selectedCalendar.value = null
+  showAccessRulesForm.value = false
+}
+
+function openImportEventsForm(calendar) {
+  selectedCalendar.value = calendar
+  showImportEventsForm.value = true
+}
+
+function closeImportEventsForm() {
+  selectedCalendar.value = null
+  showImportEventsForm.value = false
+}
+
+async function fetchUserCalendars() {
+  const [resp, sharedWithMeResp, subscriptionsResp] = await Promise.all([
+    api.getUserCalendars(),
+    api.getCalendarsSharedWithMe(),
+    api.getCalendarSubscriptions(),
+  ])
+  userCalendars.value = resp.data
+  sharedWithMeCalendars.value = sharedWithMeResp.data
+  subscriptions.value = subscriptionsResp.data
+}
+
+function openSubscriptionForm(subscription) {
+  selectedSubscription.value = subscription
+  showSubscriptionForm.value = true
+}
+
+function closeSubscriptionForm() {
+  selectedSubscription.value = null
+  showSubscriptionForm.value = false
+  refreshCalendars()
+}
+
+async function deleteSubscription(pk) {
+  const result = await confirm.value.open(
+    $gettext('Warning'),
+    $gettext('Do you really want to delete this subscription?'),
+    { color: 'warning' }
+  )
+  if (!result) {
+    return
+  }
+  await api.deleteCalendarSubscription(pk)
+  await refreshCalendars()
+  busStore.displayNotification({ msg: $gettext('Subscription deleted') })
+}
+
+function openSharedWithMeColorForm(calendar) {
+  selectedCalendar.value = calendar
+  showSharedWithMeColorForm.value = true
+}
+
+function closeSharedWithMeColorForm() {
+  selectedCalendar.value = null
+  showSharedWithMeColorForm.value = false
+}
+
+async function setCalendarVisibility(calendar, visible) {
+  await api.patchCalendarSharedWithMe(calendar.pk, { visible })
+  await refreshCalendars()
+}
+
+async function refreshCalendars() {
+  await fetchUserCalendars()
+  refreshCalendarEvents()
+}
+
+function refreshCalendarEvents() {
+  fetchUserEvents({
+    start: calendarRef.value.renderProps.start,
+    end: calendarRef.value.renderProps.end,
+  })
+}
+
+const dayClickCallback = (nativeEvent, { date }) => {
+  if (!selectedEvent.value) {
+    const startDate = new Date(date)
+    const endDate = new Date(date)
+    selectInfo.value = {
+      color: '#2196F3',
+      start: startDate,
+      end: endDate,
+      timed: false,
+    }
+    showEventForm.value = true
+  }
+}
+
+async function updateEventDates(calEvent) {
+  updating.value = true
+  var data = {
+    start: DateTime.fromMillis(calEvent.start).toJSDate(),
+    end: calEvent.end ? DateTime.fromMillis(calEvent.end).toJSDate() : null,
+  }
+  const evtCalendar = calEvent.calendar
+  if (!calEvent.timed) {
+    data.start_date = data.start.toISOString().split('T')[0]
+    data.end_date = data.end.toISOString().split('T')[0]
+    data.allDay = calEvent.allDay
+  } else if (!calEvent.end) {
+    data.end = DateTime.fromJSDate(data.start).plus({ hours: 1 }).toJSDate()
+  }
+  if (calEvent.recurrence_id) {
+    const scope = await scopeDialog.value.open($gettext('Edit event'))
+    if (!scope) {
+      // Put the occurrence back where it was
+      updating.value = false
+      refreshCalendarEvents()
+      return
+    }
+    data.recurrence_id = calEvent.recurrence_id
+    data.scope = scope
+  }
+  try {
+    await api.patchUserEvent(evtCalendar.pk, calEvent.id, data)
+    busStore.displayNotification({ msg: $gettext('Event updated') })
+  } finally {
+    updating.value = false
+  }
+  if (calEvent.recurrence_id) {
+    // Other occurrences may have changed too
+    refreshCalendarEvents()
+  }
+}
+
+const roundTime = (time, down = true) => {
+  const roundTo = 15 // minutes
+  const roundDownTime = roundTo * 60 * 1000
+
+  return down
+    ? time - (time % roundDownTime)
+    : time + (roundDownTime - (time % roundDownTime))
+}
+const toTime = (tms) => {
+  return new Date(
+    tms.year,
+    tms.month - 1,
+    tms.day,
+    tms.hour,
+    tms.minute
+  ).getTime()
+}
+
+const getEventColor = (event) => {
+  const rgb = parseInt(event.color.substring(1), 16)
+  const r = (rgb >> 16) & 0xff
+  const g = (rgb >> 8) & 0xff
+  const b = (rgb >> 0) & 0xff
+
+  return event === dragEvent.value
+    ? `rgba(${r}, ${g}, ${b}, 0.7)`
+    : event === createEvent.value
+      ? `rgba(${r}, ${g}, ${b}, 0.7)`
+      : event.color
+}
+
+const startDrag = (nativeEvent, { event, timed }) => {
+  if (event) {
+    dragEvent.value = event
+    if (timed) {
+      dragTime.value = null
+      extendOriginal.value = null
+    } else {
+      dragDay.value = null
+    }
+  }
+}
+
+const startTime = (nativeEvent, tms) => {
+  const mouse = toTime(tms)
+
+  if (dragEvent.value && dragTime.value === null) {
+    const start = dragEvent.value.start
+
+    dragTime.value = mouse - start
+  } else {
+    createStart.value = roundTime(mouse)
+    createEvent.value = {
+      title: $gettext('New event'),
+      color: '#2196F3',
+      start: createStart.value,
+      end: createStart.value,
+      timed: true,
+      editable: true,
+    }
+
+    events.value.push(createEvent.value)
+  }
+}
+
+const startDay = (nativeEvent, tms) => {
+  const mouse = toTime(tms)
+
+  if (dragEvent.value && dragDay.value === null) {
+    dragDay.value = mouse - dragEvent.value.start
+  }
+}
+
+const mouseMove = (nativeEvent, tms) => {
+  const mouse = toTime(tms)
+
+  if (dragEvent.value && dragTime.value !== null) {
+    if (!dragEvent.value.editable) {
+      return
+    }
+    moving.value = true
+    const start = dragEvent.value.start
+    const end = dragEvent.value.end
+    const duration = end - start
+    const newStartTime = mouse - dragTime.value
+    const newStart = roundTime(newStartTime)
+    const newEnd = newStart + duration
+
+    dragEvent.value.start = newStart
+    dragEvent.value.end = newEnd
+  } else if (createEvent.value && createStart.value !== null) {
+    moving.value = true
+    const mouseRounded = roundTime(mouse, false)
+    const min = Math.min(mouseRounded, createStart.value)
+    const max = Math.max(mouseRounded, createStart.value)
+
+    createEvent.value.start = min
+    createEvent.value.end = max
+  }
+}
+
+const mouseMoveDay = (nativeEvent, tms) => {
+  const mouse = toTime(tms)
+  if (dragEvent.value && dragDay.value !== null) {
+    if (!dragEvent.value.editable) {
+      return
+    }
+    moving.value = true
+    const start = dragEvent.value.start
+    const end = dragEvent.value.end
+    const duration = end - start
+    const newStartTime = mouse - dragDay.value
+    const newStart = roundTime(newStartTime)
+    const newEnd = newStart + duration
+
+    dragEvent.value.start = newStart
+    dragEvent.value.end = newEnd
+  }
+}
+
+const extendBottom = (event) => {
+  createEvent.value = event
+  createStart.value = event.start
+  extendOriginal.value = event.end
+}
+
+const endDrag = () => {
+  if (createEvent.value && !extendOriginal.value) {
+    selectInfo.value = createEvent.value
+    showEventForm.value = true
+  } else {
+    if (moving.value) {
+      if (dragEvent.value) {
+        updateEventDates(dragEvent.value)
+      } else if (createEvent.value) {
+        updateEventDates(createEvent.value)
+      }
+    } else {
+      selectedEvent.value = dragEvent.value
+      showEventForm.value = true
+    }
+
+    dragTime.value = null
+    dragEvent.value = null
+    createEvent.value = null
+    createStart.value = null
+    extendOriginal.value = null
+    moving.value = false
+  }
+}
+
+const endDragDay = () => {
+  if (dragEvent.value) {
+    if (moving.value) {
+      updateEventDates(dragEvent.value)
+    } else {
+      selectedEvent.value = dragEvent.value
+      showEventForm.value = true
+    }
+  }
+  dragEvent.value = null
+  dragDay.value = null
+  moving.value = false
+}
+
+const cancelDrag = () => {
+  if (createEvent.value) {
+    if (extendOriginal.value) {
+      createEvent.value.end = extendOriginal.value
+    } else {
+      const i = events.value.indexOf(createEvent.value)
+      if (i !== -1) {
+        events.value.splice(i, 1)
+      }
+    }
+  }
+
+  createEvent.value = null
+  createStart.value = null
+  dragTime.value = null
+  dragEvent.value = null
+  moving.value = false
+}
+
+function closeEventForm() {
+  showEventForm.value = false
+  selectedEvent.value = null
+}
+
+function editCalendar(calendar) {
+  selectedCalendar.value = calendar
+  showCalendarForm.value = true
+}
+
+async function deleteCalendar(calendarPk) {
+  const result = await confirm.value.open(
+    $gettext('Warning'),
+    $gettext('Do you really want to delete this calendar?'),
+    { color: 'warning' }
+  )
+  if (!result) {
+    return
+  }
+  await api.deleteUserCalendar(calendarPk)
+  await fetchUserCalendars()
+  events.value = []
+  calendarRef.value.checkChange()
+  busStore.displayNotification({ msg: $gettext('Calendar deleted') })
+}
+
+watch(
+  leftMenuItems,
+  (value) => {
+    layoutStore.setLeftMenuItems(value)
+  },
+  { immediate: true }
+)
+
+watch(ctype, async () => {
+  await nextTick()
+  scrollToWorkingHours()
+})
+
+onMounted(() => {
+  scrollToWorkingHours()
+  calendarRef.value.checkChange()
+})
+
+async function fetchPreferences() {
+  const resp = await parametersApi.getUserApplication('calendars')
+  preferences.value = resp.data.params
+}
+
+await Promise.all([fetchUserCalendars(), fetchPreferences()])
+</script>
+
+<style scoped>
+.v-event-draggable {
+  padding-left: 6px;
+}
+
+.v-event-timed {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.v-event-drag-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 4px;
+  height: 4px;
+  cursor: ns-resize;
+
+  &::after {
+    display: none;
+    position: absolute;
+    left: 50%;
+    height: 4px;
+    border-top: 1px solid white;
+    border-bottom: 1px solid white;
+    width: 16px;
+    margin-left: -8px;
+    opacity: 0.8;
+    content: '';
+  }
+
+  &:hover::after {
+    display: block;
+  }
+}
+</style>

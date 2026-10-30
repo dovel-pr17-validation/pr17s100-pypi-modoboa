@@ -1,0 +1,146 @@
+"""Radicale test mocks."""
+
+from caldav import Event
+from caldav.lib.url import URL
+
+
+EV1 = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+UID:20010712T182145Z-123401@example.com
+DTSTAMP:20060712T182145Z
+DTSTART:20060714T170000Z
+DTEND:20060715T040000Z
+SUMMARY:Bastille Day Party
+END:VEVENT
+END:VCALENDAR
+"""
+
+EV2 = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+UID:20010712T182145Z-123401@example.com
+DTSTAMP:20070712T182145Z
+DTSTART:20070714T170000Z
+DTEND:20070715T040000Z
+SUMMARY:Bastille Day Party +1year
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+EV_RECURRING = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+UID:weekly-1
+DTSTAMP:20260901T000000Z
+DTSTART:20260901T080000Z
+DTEND:20260901T090000Z
+RRULE:FREQ=WEEKLY;COUNT=5
+SUMMARY:Weekly meeting
+END:VEVENT
+END:VCALENDAR
+"""
+
+EV_ALLDAY = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+UID:allday-1
+DTSTAMP:20260901T000000Z
+DTSTART;VALUE=DATE:20260902
+DTEND;VALUE=DATE:20260903
+RRULE:FREQ=WEEKLY;COUNT=3
+SUMMARY:All day
+END:VEVENT
+END:VCALENDAR
+"""
+
+EV_RECURRING_EXCEPTIONS = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+UID:weekly-2
+DTSTAMP:20260901T000000Z
+DTSTART:20260901T080000Z
+DTEND:20260901T090000Z
+RRULE:FREQ=WEEKLY;UNTIL=20261231T235959Z
+EXDATE:20260908T080000Z,20260922T080000Z
+SUMMARY:Weekly meeting
+END:VEVENT
+BEGIN:VEVENT
+UID:weekly-2
+DTSTAMP:20260901T000000Z
+RECURRENCE-ID:20260929T080000Z
+DTSTART:20260929T100000Z
+DTEND:20260929T110000Z
+SUMMARY:Moved meeting
+END:VEVENT
+END:VCALENDAR
+"""
+
+#: Actions performed on the fake CalDAV server, in order
+ACTIONS = []
+
+
+class Response:
+    """Fake requests response."""
+
+    def __init__(self, status):
+        self.status = status
+        self.raw = ""
+
+
+class DAVClientMock:
+    """Mock class for DAVClient instance."""
+
+    url = URL.objectify("http://localhost")
+    #: caldav >= 3.4 reads client.features before PROPPATCH (None = no settle delay)
+    features = None
+
+    def mkcalendar(self, url):
+        return True
+
+    def delete(self, url):
+        ACTIONS.append(("delete", str(url)))
+        return True
+
+    def proppatch(self, url, body, dummy=None):
+        return Response(200)
+
+    def request(self, url, method="GET", body="", headers=None):
+        return Response(200)
+
+
+class Calendar:
+
+    #: iCalendar data returned by event_by_url
+    event_data = EV1
+
+    def __init__(self, client=None, url=None, parent=None, name=None, id=None, **extra):
+        self.url = URL.objectify(url or "http://localhost/calendar")
+        self.client = DAVClientMock()
+
+    def add_event(self, data):
+        ACTIONS.append(("add_event", str(self.url), data))
+        return True
+
+    def save_event(self, *args, **kwargs):
+        ACTIONS.append(("save_event", str(self.url), kwargs))
+        return True
+
+    def event_by_url(self, url):
+        res = Event(url=url, data=self.event_data, parent=self)
+        return res
+
+    def search(self, **kwargs):
+        return [
+            Event(data=EV1, parent=self),
+            Event(data=EV2, parent=self),
+        ]
+
+    def set_properties(self, properties):
+        return True

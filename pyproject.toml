@@ -1,0 +1,138 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modoboa"
+dynamic = ["version"]
+authors = [
+  { name="Antoine Nguyen", email="tonio@ngyn.org" },
+]
+description = "Mail hosting made simple"
+readme = "README.rst"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: ISC License (ISCL)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+	"Programming Language :: Python :: 3.14",
+	"Programming Language :: SQL",
+    "Topic :: Communications :: Email",
+    "Topic :: Internet :: WWW/HTTP",
+]
+keywords = ["email"]
+license = {file = "LICENSE"}
+dependencies = [
+	"django==5.2.18",
+	"django-phonenumber-field[phonenumbers]==9.0.0",
+	"django-reversion==6.4.0",
+	"django-xforwardedfor-middleware==2.0",
+	"django-otp==1.7.5",
+	"django-filter",
+	"django-rename-app==0.1.7",
+	"django-environ",
+	"dj-database-url",
+	"djangorestframework>=3.16,<3.19",
+	"drf-spectacular",
+	"uritemplate",
+	"django-oauth-toolkit>=3.4.0",
+	"django-cors-headers",
+	"libpass>=1.9.3",
+	"bcrypt~=5.0", # Requires libffi-dev and python-dev
+	"asgiref",
+	"dnspython==2.9.0",
+	"feedparser==6.0.14",
+	"fido2==2.2.1",
+	"progressbar33==2.4",
+	"python-dateutil",
+	"cryptography",
+	"pytz",
+	"requests",
+	"lxml_html_clean",
+	"charset-normalizer>=3.0.0",
+	"ovh",
+	"oath",
+	"packaging",
+	"redis>=7.1.0",
+	"rrdtool-bindings>=0.2.0",
+	"qrcode",
+	"aiosmtplib",
+	# PDF credentials
+	"reportlab",
+	# DMARC
+	"tldextract>=2.0.2",
+	"defusedxml>=0.6.0",
+	"python-magic>=0.4.24",
+	# RQ
+	# rq>=2.11 passes a `name` kwarg to CronScheduler.register() that
+	# django-rq's DjangoCronScheduler.register() did not accept before
+	# 4.2, breaking `manage.py rqcron` (see rq/django-rq#818). Require
+	# the fixed django-rq release instead of capping rq.
+	"rq>=2.7.0",
+	"django-rq>=4.2",
+	# Sieve
+	"sievelib>=1.6.0",
+	# User
+	"drf-nested-routers",
+	"vobject",
+	"caldav==3.6.0",
+	# Calendar subscriptions (already required by caldav)
+	"icalendar",
+	"recurring-ical-events",
+	# Amavis
+	"html2text",
+	"idna",
+]
+[project.optional-dependencies]
+dev = [
+	"django-debug-toolbar",
+	"pre-commit",
+	"black",
+	"ruff",
+	"django-extensions",
+	"Werkzeug",
+	"pyOpenSSL"
+]
+mysql = ["mysqlclient<2.3.1"]
+postgresql = [
+	"psycopg[binary]>=3.1; platform_system != 'FreeBSD'",
+	"psycopg[c]>=3.1; platform_system == 'FreeBSD'"
+]
+test = [
+	"argon2-cffi>=16.1.0",
+	"factory-boy<3.4.0",
+	"httmock==1.4.0",
+	"testfixtures==12.4.0",
+    "freezegun",
+	"tblib",
+	"tox",
+]
+ldap = ["django-auth-ldap<6.0.0"]
+
+[project.scripts]
+modoboa-cli = "modoboa:modoboa_admin"
+
+[project.urls]
+Homepage = "http://modoboa.org/"
+Documentation = "https://modoboa.readthedocs.io/en/latest/"
+Discussion = "https://github.com/modoboa/modoboa/discussions"
+Repository = "https://github.com/modoboa/modoboa"
+Changelog = "https://github.com/modoboa/modoboa/blob/master/CHANGELOG.md"
+Issues = "https://github.com/modoboa/modoboa/issues"
+Wiki = "https://github.com/modoboa/modoboa/wiki"
+Demo = "https://demo.modoboa.org/"
+
+[tool.setuptools.dynamic]
+version = {attr = "modoboa.version.get_version"}
+
+[tool.ruff]
+exclude = ["migrations"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "Q", "UP"]

@@ -1,0 +1,515 @@
+---
+title: manual step to install webserver component on modoboa
+description: This guide describe how to install webserver on the modoboa platform
+head:
+  - - meta
+    - name: 'keywords'
+      content: 'modoboa, installation, webserver, nginx, apache, wsgi' 
+---
+
+# Web server {#webserver}
+
+::: info
+The following instructions are meant to help you get your site up and
+running quickly. However it is not possible for the people contributing
+documentation to Modoboa to test every single combination of web server,
+wsgi server, distribution, etc. So it is possible that **your**
+installation of uwsgi or nginx or Apache or what-have-you works
+differently. Keep this in mind.
+:::
+
+## Apache2
+
+First, make sure that `mod_wsgi` is installed on your server.
+
+Create a new virtualhost in your Apache configuration and put the
+following content inside:
+
+```txt
+WSGIPythonHome /var/www/modoboa/env
+WSGIPythonPath /var/www/modoboa/instance
+
+<VirtualHost *:80>
+    ServerName <your value>
+
+    DocumentRoot   {{ modoboa_instance_path }}
+
+    Alias /media/  {{ modoboa_instance_path }}/media/
+    <Directory  {{ modoboa_instance_path }}/media/>
+    Options FollowSymLinks
+    Require all granted
+    </Directory>
+
+    Alias /sitestatic/  {{ modoboa_instance_path }}/sitestatic/
+    <Directory  {{ modoboa_instance_path }}/sitestatic/>
+    Options FollowSymLinks
+    Require all granted
+    </Directory>
+
+    WSGIScriptAliasMatch ^/(api|accounts)  {{ modoboa_instance_path }}/instance/wsgi.py
+    WSGIApplicationGroup %{GLOBAL}
+
+    # Pass Authorization header to enable API usage:
+    WSGIPassAuthorization On
+
+    Alias /  {{ modoboa_instance_path }}/frontend
+    <Directory  {{ modoboa_instance_path }}/frontend>
+    Options FollowSymLinks
+    Require all granted
+    </Directory>
+
+    LogLevel info
+</VirtualHost>
+```
+
+This is just one possible configuration.
+
+Replace values between `<>` with yours. If you don't use a [virtualenv](http://virtualenv.readthedocs.org/en/latest/),
+just remove the last part of the `WSGIDaemonProcess` directive. .. note:
+
+You may need to add:
+
+``` python [ {{ modoboa_instance_path }}/instance/wsgi.py]
+import sys
+
+sys.path.append('{{ modoboa_instance_path }}')
+sys.path.append('{{ modoboa_venv_path }}/bin')
+sys.path.append('{{ modoboa_venv_path }}/lib/python3.X/site-packages')
+```
+
+in :file:` {{ modoboa_instance_path }}/instance/wsgi.py`.
+
+::: tip
+You will certainly need more configuration in order to launch Apache.
+:::
+
+Now, you can go the `dovecot` section to continue the installation.
+
+## Nginx
+
+This section covers two different ways of running Modoboa behind
+[Nginx](http://nginx.org/) using a WSGI application server. 
+
+Choose the one you prefer between 
+[Green Unicorn](http://gunicorn.org/) or [uWSGI](https://github.com/unbit/uwsgi).
+
+In both cases, you\'ll need to download and [install nginx](http://wiki.nginx.org/Install).
+
+### uWSGI
+
+The following setup is meant to get you started quickly. You should read
+the documentation of both nginx and uwsgi to understand how to optimize
+their configuration for your site.
+
+The Django documentation includes the following warning regarding uwsgi:
+
+::: warning
+Use uwsgi 1.2.6 or newer. If you do not, you *will* run into problems.
+Modoboa will fail in obscure ways.
+:::
+
+To use this setup, first [download and install uwsgi](http://uwsgi-docs.readthedocs.org/en/latest/WSGIquickstart.html).
+
+Recommend packages for debian and derivatives:
+
+```shell
+apt install uwsgi uwsgi-plugin-python3
+```
+
+Here is a sample nginx configuration:
+
+``` nginx
+upstream modoboa {
+    server unix:{{ uwsgi_socket_path }} fail_timeout=0;
+}
+
+upstream modoboa_introspect {
+    server unix:{{ uwsgi_introspect_socket_path }} fail_timeout=0;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ hostname }};
+    rewrite ^ https://$server_name$request_uri? permanent;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ hostname }};
+    root {{ modoboa_instance_path }};
+
+    ssl_certificate  <ssl certificate for your site>;
+    ssl_certificate_key  <ssl certificate key for your site>;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers "ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384";
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_verify_depth 3;
+    ssl_dhparam /etc/nginx/dhparam.pem;
+
+    client_max_body_size 10M;
+
+    access_log /var/log/nginx/modoboa-access.log;
+    error_log /var/log/nginx/modoboa-error.log;
+
+    location /sitestatic/ {
+        try_files $uri $uri/ =404;
+    }
+
+    location /media/ {
+        try_files $uri $uri/ =404;
+    }
+
+    location = /api/o/introspect/ {
+        include uwsgi_params;
+        uwsgi_param UWSGI_SCRIPT instance.wsgi:application;
+        uwsgi_pass modoboa_introspect;
+        uwsgi_read_timeout 15s;
+    }
+
+    location ~ ^/(api|accounts|autodiscover) {
+        include uwsgi_params;
+        uwsgi_param UWSGI_SCRIPT instance.wsgi:application;
+        uwsgi_pass modoboa;
+    }
+
+    location / {
+        alias  {{ modoboa_instance_path }}/frontend/;
+        index  index.html;
+
+        expires -1;
+        add_header Pragma "no-cache";
+        add_header Cache-Control "no-store, no-cache, must-revalidate, post-check=0, pre-check=0";
+
+        try_files $uri $uri/ /index.html = 404;
+    }
+}
+```
+
+'uwsgi_socket_path', `modoboa instance name`, `hostname`,
+`modoboa_instance_path` and `ssl...` must be replaced by the value
+you used when `you deployed your instance deployment`
+
+To enable mail client auto-configuration, see [below](#autoconfig).
+
+If you do not plan to use SSL then change the listen directive to `listen 80;` and delete each of the following directives:
+
+```txt
+    ssl on;
+    keepalive_timeout 70;
+    ssl_certificate     {{ssl certificate for your site}};
+    ssl_certificate_key {{ssl certificate key for your site}};
+    uwsgi_param UWSGI_SCHEME https;
+```
+
+If you do plan to use SSL, you\'ll have to generate a certificate and a
+key. [This article](http://wiki.nginx.org/HttpSslModule#Generate_Certificates)
+contains information about how to do it.
+
+Make sure to replace the `...` in the sample configuration with
+appropriate values. Here are some explanations for the cases that may
+not be completely self-explanatory:
+
+* `hostname`: This is the URL which will be the root of your Modoboa site at your
+    domain. For instance, if your Modoboa installation is reachable at
+    at `https://foo/modoboa` then `hostname` is `/modoboa`. In this
+    case you probably also have to set the `alias` directives to point
+    to where Modoboa\'s sitestatic and media directories are because
+    otherwise nginx won\'t be able to find them.
+
+    If Modoboa is at the root of your domain, then `hostname` is an
+    empty string and can be deleted from the configuration above. In
+    this case, you probably do not need the `alias` directives.
+* `uwsgi_socket_path`: The location where uwsig is listening. It could be a unix domain
+    socket or an address:port combination. Ubuntu configures uwsgi so that the port is:
+    ```txt
+    unix:/run/uwsgi/app/ app name /socket
+    ```
+    where `app name` is the name of the application.
+* `uwsgi_introspect_socket_path`: The location where the uwsgi instance
+    dedicated to OAuth2 introspection is listening (see below).
+
+Your uwsgi configuration should be:
+
+``` ini{3,4}
+[uwsgi]
+# Not needed when using uwsgi from pip
+# plugins = python
+chdir =  <modoboa_instance_path>
+module = <name>.wsgi:application
+master = true
+harakiri = 60
+processes = 4
+vhost = true
+no-default-app = true
+buffer-size = 8192
+max-requests = 5000
+single-interpreter = true
+```
+
+The plugins directive should be turned on if you use a uwsgi
+installation that requires it. If uwsgi was installed from pip, it does
+not require it. In the configuration above:
+
+* `modoboa_instance_path`: The directory where `manage.py` resides. 
+    This directory is the parent of `modoboa's settings dir`
+* `name`: The name that you passed to `modoboa-admin.py deploy`
+    when you created your Modoboa instance, usually `instance`.
+
+#### Dedicated instance for OAuth2 introspection
+
+Dovecot validates the OAuth2 tokens used by the webmail by calling the
+`/api/o/introspect/` endpoint of Modoboa, while a webmail request waits
+for Dovecot. If this endpoint was served by the same uwsgi instance,
+every worker could end up waiting for Dovecot, leaving none to answer
+the introspection call: uwsgi would lock up until restarted.
+
+That is why the nginx configuration above routes this endpoint to a
+second uwsgi instance. Create a second configuration file, with the
+same content as the first one except for the following lines:
+
+``` ini
+# An introspection is a single SQL query: 2 processes are enough
+processes = 2
+socket = <uwsgi_introspect_socket_path>
+harakiri = 10
+```
+
+On Debian and derivatives, if the files are named
+`modoboa_instance.ini` and `modoboa_introspect_instance.ini`, the socket
+paths are respectively `/run/uwsgi/app/modoboa_instance/socket` and
+`/run/uwsgi/app/modoboa_introspect_instance/socket`.
+
+Now, you can go the `dovecot` section to continue the installation.
+
+### Green Unicorn
+
+Firstly, [Download and install gunicorn](http://gunicorn.org/install.html). 
+
+Then, use the following sample gunicorn configuration 
+(create a new file named `gunicorn.conf.py` inside Modoboa's root dir):
+
+```ini gunicorn.conf.py
+backlog = 2048
+bind = "unix:/var/run/gunicorn/modoboa.sock"
+pidfile = "/var/run/gunicorn/modoboa.pid"
+daemon = True
+debug = False
+workers = 2
+logfile = "/var/log/gunicorn/modoboa.log"
+loglevel = "info"
+```
+
+
+To start gunicorn, execute the following commands:
+
+``` shell
+$ cd {{ modoboa dir }} 
+$ gunicorn -c gunicorn.conf.py {{ APP/INSTANCE Name }}.wsgi:application
+```
+
+Now the nginx part. Just create a new virtual host and use the following
+configuration:
+
+``` nginx
+upstream modoboa {
+    server      unix:/var/run/gunicorn/modoboa.sock fail_timeout=0;
+}
+
+server {
+    listen 443 ssl;
+    ssl on;
+    keepalive_timeout 70;
+
+    server_name {{ host fqdn }};
+    root  {{ modoboa_instance_path }};
+
+    access_log  /var/log/nginx/{{ host fqdn }}.access.log;
+    error_log /var/log/nginx/{{ host fqdn }}.error.log;
+
+    ssl_certificate     {{ ssl certificate for your site }};
+    ssl_certificate_key {{ ssl certificate key for your site }};
+
+    location /sitestatic/ {
+        autoindex on;
+    }
+
+    location /media/ {
+        autoindex on;
+    }
+
+    location / {
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $http_host;
+        proxy_redirect off;
+        proxy_set_header X-Forwarded-Protocol ssl;
+        proxy_pass http://modoboa;
+    }
+}
+```
+
+If you do not plan to use SSL then change the listen directive to `listen 80;` 
+and delete each of the following directives:
+
+```txt
+ssl on;
+keepalive_timeout 70;
+ssl_certificate     <ssl certificate for your site>;
+ssl_certificate_key <ssl certificate key for your site>;
+proxy_set_header X-Forwarded-Protocol ssl;
+```
+
+If you do plan to use SSL, you\'ll have to generate a certificate and a key. 
+
+[This article](http://wiki.nginx.org/HttpSslModule#Generate_Certificates) contains information about how to do it.
+
+Paste this content to your configuration (replace values between `<>` with yours) and restart nginx.
+
+::: tip
+As explained in the uWSGI section, the `/api/o/introspect/` endpoint
+should be served by a second gunicorn instance, listening on its own
+socket, with a dedicated `upstream` and an exact match
+`location = /api/o/introspect/` block. Otherwise, gunicorn can lock up
+when all its workers wait for Dovecot.
+:::
+
+## Mail client auto-configuration {#autoconfig}
+
+Modoboa can tell mail clients which servers to use, so users only have
+to type their email address and password:
+
+* `/mail/config-v1.1.xml`: Thunderbird (desktop and Android) and
+  other clients supporting the Mozilla format,
+* `/autodiscover/autodiscover.xml`: Outlook,
+* `/mobileconfig?emailaddress=<address>`: profile for Apple Mail (iOS
+  and macOS), to download manually.
+
+### Connection settings
+
+The returned values come from the `EMAIL_CLIENT_CONNECTION_SETTINGS`
+variable of your `settings.py` file. By default, the same hostname is
+used for IMAP and SMTP, so adjust it if your SMTP server has its own
+name:
+
+``` python
+EMAIL_CLIENT_CONNECTION_SETTINGS = {
+    "imap": {"HOSTNAME": "imap.example.net", "SOCKET_TYPE": "SSL", "PORT": 993},
+    "smtp": {"HOSTNAME": "smtp.example.net", "SOCKET_TYPE": "STARTTLS", "PORT": 587},
+}
+```
+
+`HOSTNAME` accepts the `%EMAILDOMAIN%`, `%EMAILLOCALPART%` and
+`%EMAILADDRESS%` placeholders (for example `mail.%EMAILDOMAIN%`).
+`SOCKET_TYPE` must be `SSL`, `STARTTLS` or `plain`.
+
+::: warning
+Thunderbird for Android rejects the whole configuration when
+`SOCKET_TYPE` is `plain`.
+:::
+
+The configuration announces `password-cleartext` authentication: it
+means the password is sent inside the TLS connection, which is the
+expected setting for Modoboa.
+
+### DNS records
+
+For each domain, mail clients look for the following names, which must
+point to your Modoboa server:
+
+``` txt
+autoconfig.example.net.    IN CNAME mail.example.net.
+autodiscover.example.net.  IN CNAME mail.example.net.
+```
+
+Instead of `autodiscover.<domain>`, Outlook also accepts an SRV record:
+
+``` txt
+_autodiscover._tcp.example.net. IN SRV 0 0 443 mail.example.net.
+```
+
+Modoboa checks the `autoconfig` and `autodiscover` records when the
+*Enable autoconfig checks* parameter is set.
+
+### Allowed hosts
+
+Django rejects (HTTP 400) the requests whose host is not listed in
+`ALLOWED_HOSTS`. Add each auto-configuration hostname to your
+`settings.py` file:
+
+``` python
+ALLOWED_HOSTS = [
+    "mail.example.net",
+    "autoconfig.example.net",
+    "autodiscover.example.net",
+]
+```
+
+### Virtual host
+
+Thunderbird tries HTTPS first and only trusts a configuration fully
+retrieved over HTTPS: the auto-configuration hostnames must be covered
+by a valid certificate. With Let's Encrypt, for example:
+
+``` shell
+$ certbot certonly --expand -d mail.example.net -d autoconfig.example.net -d autodiscover.example.net
+```
+
+Then create a dedicated virtual host. With uWSGI:
+
+``` nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name autoconfig.example.net autodiscover.example.net;
+    rewrite ^ https://$host$request_uri? permanent;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name autoconfig.example.net autodiscover.example.net;
+    root {{ modoboa_instance_path }};
+
+    ssl_certificate  <ssl certificate for your site>;
+    ssl_certificate_key  <ssl certificate key for your site>;
+
+    access_log /var/log/nginx/autoconfig-access.log;
+    error_log /var/log/nginx/autoconfig-error.log;
+
+    location ~ ^/(mail/config-v1.1.xml|mobileconfig|autodiscover/autodiscover.xml) {
+        include uwsgi_params;
+        uwsgi_param UWSGI_SCRIPT instance.wsgi:application;
+        uwsgi_pass modoboa;
+    }
+}
+```
+
+With Green Unicorn, replace the `location` content by:
+
+``` nginx
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://modoboa;
+```
+
+Repeat the `server_name` entries, the certificate names and the
+`ALLOWED_HOSTS` entries for each domain you host.
+
+### Testing
+
+Thunderbird for Android does not send the email address, so test
+without it too:
+
+``` shell
+$ curl -v https://autoconfig.example.net/mail/config-v1.1.xml
+$ curl -v "https://autoconfig.example.net/mail/config-v1.1.xml?emailaddress=user@example.net"
+```
+
+Both must return HTTP 200 and an XML document whose `emailProvider`
+`id` attribute is your domain. If Thunderbird for Android still reports
+that it found no settings, the reason is written in its debug logs
+(enable debug logging in the app settings, then use `adb logcat`).
+
+Now, you can go the [Dovecot](./dovecot) section to continue the installation.

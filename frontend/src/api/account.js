@@ -1,0 +1,120 @@
+import repository from './repository'
+
+const resource = 'account'
+
+const filterSetUrl = (name) =>
+  `${resource}/filtersets/${encodeURIComponent(name)}`
+const filterUrl = (filterSetName, name) =>
+  `${filterSetUrl(filterSetName)}/filters/${encodeURIComponent(name)}`
+
+export default {
+  getMe() {
+    return repository.get(`/${resource}/me/`)
+  },
+  updateMe(data) {
+    return repository.put(`/${resource}/me/`, data)
+  },
+  checkPassword(value) {
+    return repository.post(`/${resource}/me/password/`, { password: value })
+  },
+  setPassword(data) {
+    return repository.post(`/${resource}/me/password/change/`, data, {
+      ignoreErrors: true,
+    })
+  },
+  verifyTFACode(code) {
+    const payload = { code }
+    return repository.post(`${resource}/tfa/verify/`, payload)
+  },
+  startTFASetup() {
+    return repository.post(`${resource}/tfa/setup/`)
+  },
+  getKeyForTFASetup() {
+    return repository.get(`${resource}/tfa/setup/key/`)
+  },
+  finalizeTFASetup(pinCode) {
+    const payload = { pin_code: pinCode }
+    return repository.post(`${resource}/tfa/setup/check/`, payload)
+  },
+  disableTFA(data) {
+    return repository.post(`${resource}/tfa/disable/`, data)
+  },
+  resetRecoveryCodes(data) {
+    return repository.post(`${resource}/tfa/reset_codes/`, data)
+  },
+  getForward() {
+    return repository.get(`${resource}/forward/`)
+  },
+  setForward(data) {
+    return repository.post(`${resource}/forward/`, data)
+  },
+  getAPIToken() {
+    return repository.get(`${resource}/api_token/`)
+  },
+  createAPIToken() {
+    return repository.post(`${resource}/api_token/`)
+  },
+  deleteAPIToken() {
+    return repository.delete(`${resource}/api_token/`)
+  },
+  getARMessage() {
+    return repository.get(`${resource}/armessage/`)
+  },
+  setARMessage(data) {
+    return repository.put(`${resource}/armessage/`, data)
+  },
+  getFilterSets() {
+    return repository.get(`${resource}/filtersets/`)
+  },
+  downloadFilterSet(filterSetName) {
+    return repository.get(`${filterSetUrl(filterSetName)}/download/`)
+  },
+  createFilterSet(data) {
+    return repository.post(`${resource}/filtersets/`, data)
+  },
+  activateFilterSet(filterSetName) {
+    return repository.post(`${filterSetUrl(filterSetName)}/activate/`)
+  },
+  deactivateActiveFilterSet() {
+    return repository.post(`${resource}/filtersets/deactivate_active/`)
+  },
+  deleteFilterSet(filterSetName) {
+    return repository.delete(`${filterSetUrl(filterSetName)}/`)
+  },
+  saveFilterSet(filterSetName, data) {
+    return repository.put(`${filterSetUrl(filterSetName)}/`, data)
+  },
+  getFilterConditionTemplates() {
+    return repository.get(`${resource}/filtersets/condition_templates/`)
+  },
+  getFilterActionTemplates() {
+    return repository.get(`${resource}/filtersets/action_templates/`)
+  },
+  getFilters(filterSetName) {
+    return repository.get(`${filterSetUrl(filterSetName)}/filters/`)
+  },
+  createFilter(filterSetName, data) {
+    return repository.post(`${filterSetUrl(filterSetName)}/filters/`, data)
+  },
+  updateFilter(filterSetName, filter, data) {
+    return repository.put(`${filterUrl(filterSetName, filter)}/`, data)
+  },
+  disableFilter(filterSetName, filter) {
+    return repository.post(`${filterUrl(filterSetName, filter)}/disable/`)
+  },
+  moveFilterDown(filterSetName, filter) {
+    return repository.post(`${filterUrl(filterSetName, filter)}/move_down/`)
+  },
+  moveFilterUp(filterSetName, filter) {
+    return repository.post(`${filterUrl(filterSetName, filter)}/move_up/`)
+  },
+  enableFilter(filterSetName, filter) {
+    return repository.post(`${filterUrl(filterSetName, filter)}/enable/`)
+  },
+  deleteFilter(filterSetName, filter) {
+    return repository.delete(`${filterUrl(filterSetName, filter)}/`)
+  },
+  getAvailableApplications() {
+    return repository.get(`${resource}/available_applications/`)
+  },
+}

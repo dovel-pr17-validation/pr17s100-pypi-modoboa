@@ -1,0 +1,541 @@
+"""
+Set of classes to manipulate/display emails inside the webmail.
+"""
+
+import base64
+import html
+import re
+import email
+from urllib.parse import unquote
+
+from charset_normalizer import detect as charset_detect
+
+from django.apps import apps
+from django.utils.html import conditional_escape
+from django.utils.translation import gettext as _
+
+from modoboa.lib.email_utils import Email
+from modoboa.webmail import constants
+
+from . import imapheader
+from .imaputils import get_imapconnector, validate_imap_uid, BodyStructure
+from . import flowed
+from .utils import decode_payload, html2plaintext
+
+# Headers holding addresses, parsed from their raw value
+ADDRESS_HEADERS = ("From", "To", "Cc", "Bcc", "Reply-To")
+
+# Subject prefixes of replies and forwards, as clients write them in
+# various languages ("RE :", "AW:", "Réf.:", "TR:", "WG:"...)
+_REPLY_PREFIX_RE = re.compile(
+    r"^\s*(re|aw|sv|antw|odp|rif|res|ref|réf)\s*(\[\d+\])?\s*\.?\s*:", re.I
+)
+_FORWARD_PREFIX_RE = re.compile(r"^\s*(fwd?|tr|wg|rv|enc|doorst)\s*\.?\s*:", re.I)
+
+# A cid: URL inside an HTML content (RFC 2392)
+CID_URL_RE = re.compile(r"""cid:([^\s"'<>()]+)""", re.I)
+
+
+class ImapEmail(Email):
+    """
+    A class to represent an email fetched from an IMAP server.
+    """
+
+    # Embedded images are displayed even when the remote ones are not:
+    # they travel with the message and loading them tells no one it was
+    # read.
+    embed_inlines = True
+
+    headernames = [
+        ("From", True),
+        ("To", True),
+        ("Cc", True),
+        # Only found in the copies of sent messages and in drafts
+        ("Bcc", True),
+        ("Reply-To", True),
+        ("Date", True),
+        ("Subject", True),
+    ]
+
+    def __init__(self, request, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.request = request
+        self.imapc = get_imapconnector(request)
+        self.imapc = self.imapc.__enter__()
+        self.mbox, self.mailid = self.mailid.split(":")
+        self.mailid = validate_imap_uid(self.mailid)
+        # Part number -> {name, size, content_type}
+        self.attachments: dict[str, dict] = {}
+        self.To: list = []
+        # Not every message has a Date: header (drafts saved by some
+        # clients, messages injected by scripts...)
+        self.Date: str = ""
+
+    def __del__(self):
+        # The connector may not exist yet if __init__ failed, and it is
+        # closed with the request anyway.
+        imapc = getattr(self, "imapc", None)
+        if imapc is None:
+            return
+        try:
+            imapc.__exit__()
+        except Exception:
+            # Raising here only produces an "Exception ignored" traceback
+            # on stderr: the message is gone and there is nothing to do.
+            pass
+
+    def fetch_headers(self, raw_addresses: bool = False) -> None:
+        """Fetch message headers from server."""
+        # Copy the class attribute: extending it in place would make it
+        # grow on every request.
+        requested_headers = list(self.headernames)
+        if self.mbox == constants.MAILBOX_NAME_SCHEDULED:
+            requested_headers += [(constants.CUSTOM_HEADER_SCHEDULED_DATETIME, True)]
+        header_names = [header[0].upper() for header in requested_headers]
+        msg = self.imapc.fetchmail(
+            self.mbox, self.mailid, readonly=False, what=" ".join(header_names)
+        )
+        # Servers may return the requested fields in a different order,
+        # so don't rely on the exact data item name.
+        headers = next(
+            value for key, value in msg.items() if key.startswith("BODY[HEADER.FIELDS")
+        )
+        self.fetch_body_structure(msg)
+        msg = email.message_from_string(headers)
+        for hdr in requested_headers:
+            label = hdr[0]
+            hdrvalue = self.get_header(msg, label, raw=raw_addresses)
+            if not hdrvalue:
+                continue
+            if hdr[1]:
+                self.headers += [{"name": label, "value": hdrvalue}]
+            label = re.sub("-", "_", label)
+            setattr(self, label, hdrvalue)
+        if not apps.is_installed("modoboa.contacts"):
+            return
+        from modoboa.contacts import models as contacts_models
+
+        addressbook = self.request.user.addressbook_set.first()
+        if not addressbook:
+            return
+        contacts = [self.From] + self.To
+        if hasattr(self, "Cc"):
+            contacts += self.Cc
+        # One query for every address of the message
+        known = dict(
+            contacts_models.EmailAddress.objects.filter(
+                contact__addressbook=addressbook,
+                address__in=[contact["address"] for contact in contacts],
+            )
+            .order_by("-pk")
+            .values_list("address", "contact_id")
+        )
+        for contact in contacts:
+            if contact["address"] in known:
+                contact["contact_id"] = known[contact["address"]]
+
+    def get_header(self, msg, header: str, **kwargs):
+        """Look for a particular header.
+
+        We also try to decode the default value.
+        """
+        hdrvalue = super().get_header(msg, header)
+        if header in ["From", "Reply-To"]:
+            # Store a raw copy for further use
+            setattr(self, f"original_{header.replace('-', '')}", hdrvalue)
+        if not hdrvalue:
+            return ""
+        if header == "Date":
+            # The parsed value is compact, like in the listing
+            self.Date_full = imapheader.format_full_date(hdrvalue)
+        if header in ADDRESS_HEADERS:
+            # Parse the raw value: decoding encoded-words first could turn
+            # an encoded comma of a display name into an address separator.
+            hdrvalue = str(msg[header])
+        try:
+            key = re.sub("-", "_", header).lower()
+            hdrvalue = getattr(imapheader, f"parse_{key}")(hdrvalue)
+        except AttributeError:
+            pass
+        return hdrvalue
+
+    def fetch_body_structure(self, msg=None):
+        """Fetch BODYSTRUCTURE for email."""
+        if msg is None:
+            if getattr(self, "bs", None) is not None:
+                # Already loaded with the headers: no need to ask again
+                return
+            msg = self.imapc.fetchmail(self.mbox, self.mailid, readonly=False)
+        self.bs = BodyStructure(msg["BODYSTRUCTURE"])
+        self._find_attachments()
+        if self.dformat not in ["plain", "html"]:
+            self.dformat = self.request.user.parameters.get_value(self.dformat)
+        fallback_fmt = "html" if self.dformat == "plain" else "plain"
+        self.mformat = (
+            self.dformat if self.dformat in self.bs.contents else fallback_fmt
+        )
+
+    def fetch_attachments(self):
+        result = []
+        for partnum, attachment in self.attachments.items():
+            attdef, content = self.imapc.fetchpart(self.mailid, self.mbox, partnum)
+            result.append(
+                {
+                    "filename": attachment["name"],
+                    "content_type": attdef["Content-Type"],
+                    # Store the decoded payload: it is encoded again when
+                    # the message is built.
+                    "content": decode_payload(attdef["encoding"], content),
+                }
+            )
+        return result
+
+    @property
+    def subject(self):
+        """Just a shortcut to return a subject in any case."""
+        return self.Subject if hasattr(self, "Subject") else ""
+
+    @property
+    def body(self):
+        """Load email's body.
+
+        This operation has to be made "on demand" because it requires
+        a communication with the IMAP server.
+        """
+        if self._body is None:
+            self.fetch_body_structure()
+            bodyc = ""
+            parts = self.bs.contents.get(self.mformat, [])
+            # Every part of the content is retrieved with one command
+            payloads = self.imapc.fetch_parts(
+                self.mailid, self.mbox, [part["pnum"] for part in parts]
+            )
+            for part in parts:
+                raw = payloads.get(part["pnum"])
+                if raw is None:
+                    # The server answered with another part than the one
+                    # we asked for: skip it instead of failing.
+                    continue
+                content = decode_payload(part["encoding"], raw)
+                if not isinstance(content, str):
+                    charset = self._find_content_charset(part)
+                    if charset is not None:
+                        try:
+                            content = content.decode(charset)
+                        except (UnicodeDecodeError, LookupError):
+                            result = charset_detect(content)
+                            content = content.decode(result["encoding"])
+                if isinstance(content, str) and self._is_flowed(part):
+                    content = flowed.decode(
+                        content, delsp=self._find_param(part, "delsp") == "yes"
+                    )
+                bodyc += content
+            self._fetch_inlines(self._referenced_cids(bodyc))
+            self._find_unreferenced_inlines(bodyc)
+            if len(bodyc) != 0:
+                bodyc = getattr(self, f"_post_process_{self.mformat}")(bodyc)
+                self._body = getattr(self, f"viewmail_{self.mformat}")(
+                    bodyc, links=self.links, images=self.images
+                )
+        return self._body
+
+    @body.setter
+    def body(self, value):
+        self._body = value
+
+    @property
+    def source(self):
+        """Retrieve email source."""
+        return self.imapc.fetchmail(
+            self.mbox, self.mailid, readonly=True, what="source"
+        )["BODY[]"]
+
+    def _find_content_charset(self, part):
+        for pos, elem in enumerate(part["params"]):
+            if elem == "charset":
+                return part["params"][pos + 1]
+        return None
+
+    def _find_param(self, part, name: str) -> str | None:
+        """Return the value of a parameter of a part, lowercased."""
+        params = part.get("params") or []
+        for pos in range(0, len(params) - 1, 2):
+            key = params[pos]
+            if isinstance(key, str) and key.lower() == name:
+                value = params[pos + 1]
+                return value.lower() if isinstance(value, str) else None
+        return None
+
+    def _is_flowed(self, part) -> bool:
+        """Tell if a text part is in format=flowed (RFC 3676)."""
+        return self.mformat == "plain" and self._find_param(part, "format") == "flowed"
+
+    def _find_attachments(self) -> None:
+        """Retrieve attachments from the parsed body structure."""
+        for attachment in self.bs.list_attachments():
+            self.attachments[attachment.pop("partnum")] = attachment
+
+    def _referenced_cids(self, content: str) -> set[str]:
+        """Content-IDs of the inlines the displayed content shows.
+
+        None when the plain text is displayed: it can't show images.
+        """
+        if self.mformat != "html":
+            return set()
+        return {unquote(cid) for cid in CID_URL_RE.findall(content)}
+
+    def _find_unreferenced_inlines(self, content: str) -> None:
+        """List the inlines the displayed content doesn't show.
+
+        They can't be seen otherwise: an image the HTML doesn't
+        reference, or any image when the plain text is displayed.
+        """
+        referenced = self._referenced_cids(content)
+        for cid, params in self.bs.inlines.items():
+            if cid in referenced or params["pnum"] in self.attachments:
+                continue
+            attachment = self.bs.describe_part(params)
+            self.attachments[attachment.pop("partnum")] = attachment
+
+    def _fetch_inlines(self, cids: set[str] | None = None):
+        """Embed inline images into the body as data: URIs.
+
+        Images are never written to disk: storing them in a shared,
+        publicly served directory leaked them to other users (message
+        UIDs are only unique per mailbox).
+
+        Only the images the content references are retrieved (all of
+        them when ``cids`` is None), with a single command: the others
+        are listed as attachments and downloaded on demand.
+        """
+        if not (self.embed_inlines or self.images):
+            return
+        wanted = {}
+        for cid, params in self.bs.inlines.items():
+            if cids is not None and cid not in cids:
+                continue
+            content_type = params.get("Content-Type", "")
+            encoding = (params.get("encoding") or "").lower()
+            if content_type not in constants.INLINE_IMAGE_MIME_TYPES:
+                continue
+            if encoding not in ("base64", "quoted-printable"):
+                continue
+            wanted[params["pnum"]] = params
+        if not wanted:
+            return
+        payloads = self.imapc.fetch_parts(self.mailid, self.mbox, list(wanted))
+        for pnum, content in payloads.items():
+            params = wanted[pnum]
+            payload = decode_payload(params["encoding"], content)
+            params["data_uri"] = (
+                f"data:{params['Content-Type']};base64,"
+                f"{base64.b64encode(payload).decode()}"
+            )
+
+    def _map_cid(self, url):
+        if url[:4].lower() != "cid:":
+            return url
+        params = self.bs.inlines.get(unquote(url[4:]))
+        if params and "data_uri" in params:
+            return params["data_uri"]
+        return url
+
+    def fetch_attachment(self, pnum):
+        """Fetch an attachment from the IMAP server."""
+        return self.imapc.fetchpart(self.mailid, self.mbox, pnum)
+
+
+class Modifier(ImapEmail):
+    """Message modifier."""
+
+    def __init__(self, request, *args, **kwargs):
+        # The links of the quoted message are kept: they are only blocked
+        # to protect the reader
+        kwargs["links"] = True
+        super().__init__(request, *args, **kwargs)
+        self.fetch_headers(raw_addresses=True)
+        getattr(self, f"_modify_{self.dformat}")()
+        # Injected once the body is modified: it is not part of the quote
+        self._inject_textheader()
+        # The body is now in the requested format, whatever the parts of
+        # the message
+        self.mformat = self.dformat
+
+    @property
+    def embed_inlines(self) -> bool:
+        # Shown by the editor as data: URIs, turned back into parts of the
+        # message when it is sent (see make_body_images_inline)
+        return self.dformat == "html"
+
+    def _post_process_plain(self, content):
+        if self.dformat == "html":
+            # Turned into HTML by _modify_html: escaping is required
+            return super()._post_process_plain(content)
+        # Raw text for the editor: the base class escapes it for display
+        return html.unescape(super()._post_process_plain(content))
+
+    def _post_process_html(self, content):
+        if self.dformat == "plain":
+            # No text part: write the reply or the forward from the text of
+            # the HTML one
+            return html2plaintext(content)
+        return super()._post_process_html(content)
+
+    def viewmail_plain(self, contents=None, **kwargs):
+        if self.dformat == "plain":
+            return contents
+        return super().viewmail_plain(contents, **kwargs)
+
+    def _modify_plain(self):
+        pass
+
+    def _modify_html(self):
+        if self.dformat == "html" and self.mformat != self.dformat:
+            self.body = re.sub("</?pre>", "", self.body or "")
+            self.body = re.sub("\n", "<br>", self.body)
+
+
+class ReplyModifier(Modifier):
+    """Modify a message to reply to it."""
+
+    headernames = ImapEmail.headernames + [
+        ("Message-ID", False),
+        ("References", False),
+    ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @property
+    def subject(self) -> str:
+        result: str = getattr(self, "Subject", "")
+        if not result or _REPLY_PREFIX_RE.match(result):
+            return result
+        return f"Re: {result}"
+
+    def _inject_textheader(self):
+        sender = self.From.get("name") or self.From["address"]
+        date = getattr(self, "Date_full", "")
+        if date:
+            textheader = _("On %(date)s, %(sender)s wrote:") % {
+                "date": date,
+                "sender": sender,
+            }
+        else:
+            textheader = _("%(sender)s wrote:") % {"sender": sender}
+        if self.dformat == "html":
+            # The sender name comes from the message: escape it before
+            # injecting it into HTML content.
+            textheader = f"<p>{conditional_escape(textheader)}</p>"
+        else:
+            textheader = f"{textheader}\n"
+        self.body = textheader + (self.body or "")
+
+    def _modify_plain(self):
+        super()._modify_plain()
+        lines = []
+        for line in (self.body or "").split("\n"):
+            if not line:
+                lines.append(">")
+            elif line.startswith(">"):
+                # Already quoted: one more level
+                lines.append(f">{line}")
+            else:
+                lines.append(f"> {line}")
+        self.body = "\n".join(lines)
+
+    def _modify_html(self):
+        super()._modify_html()
+        self.body = f'<blockquote type="cite">{self.body or ""}</blockquote>'
+
+
+class ForwardModifier(Modifier):
+    """Modify a message so it can be forwarded."""
+
+    @property
+    def subject(self) -> str:
+        result: str = getattr(self, "Subject", "")
+        if _FORWARD_PREFIX_RE.match(result):
+            return result
+        return f"Fwd: {result}"
+
+    def __getfunc(self, name):
+        return getattr(self, f"{name}_{self.dformat}")
+
+    def _inject_textheader(self):
+        textheader = self.__getfunc("_header_begin")()
+        if self.dformat == "plain":
+            textheader += "\n"
+        textheader += self.__getfunc("_header_line")(
+            _("Subject"), getattr(self, "Subject", "")
+        )
+        textheader += self.__getfunc("_header_line")(
+            _("Date"), getattr(self, "Date_full", "") or self.Date
+        )
+        for hdr in ["From", "To", "Reply-To", "Cc"]:
+            try:
+                key = re.sub("-", "_", hdr)
+                value = getattr(self, key)
+                if isinstance(value, dict):
+                    value = value["fulladdress"]
+                else:
+                    value = ", ".join(item["fulladdress"] for item in value)
+                textheader += self.__getfunc("_header_line")(_(hdr), value)
+            except AttributeError:
+                pass
+        textheader += self.__getfunc("_header_end")()
+        self.body = textheader + (self.body or "")
+
+    def _header_begin_plain(self):
+        return f"----- {_('Original message')} -----"
+
+    def _header_begin_html(self):
+        return f"<p>----- {_('Original message')} -----</p>"
+
+    def _header_line_plain(self, key, value):
+        return f"{key}: {value}\n"
+
+    def _header_line_html(self, key, value):
+        return f"<p>{key}: {conditional_escape(value)}</p>"
+
+    def _header_end_plain(self):
+        return "\n"
+
+    def _header_end_html(self):
+        return ""
+
+
+class EditModifier(ImapEmail):
+    """Load a draft message so it can be edited.
+
+    The body is returned as raw content for the editor: plain text is
+    neither escaped nor wrapped in a <pre> block. Links are kept and
+    embedded images are given as data: URIs (turned back into parts of the
+    message when it is saved or sent).
+    """
+
+    headernames = ImapEmail.headernames + [
+        ("In-Reply-To", False),
+        ("References", False),
+    ]
+
+    def __init__(self, request, *args, dformat=None, **kwargs):
+        # Without an explicit format, the draft is loaded in the format it
+        # was written in, whatever the user preferences.
+        self.detect_format = dformat is None
+        kwargs["links"] = True
+        super().__init__(request, *args, dformat=dformat or "plain", **kwargs)
+        self.fetch_headers()
+
+    def fetch_body_structure(self, msg=None):
+        super().fetch_body_structure(msg)
+        if self.detect_format:
+            self.dformat = self.mformat = (
+                "html" if "html" in self.bs.contents else "plain"
+            )
+
+    def _post_process_plain(self, content):
+        return content.strip()
+
+    def viewmail_plain(self, contents=None, **kwargs):
+        return contents

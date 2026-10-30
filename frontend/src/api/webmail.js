@@ -1,0 +1,221 @@
+import repository from './repository'
+
+export default {
+  getUserMailboxes(mailbox) {
+    const params = {}
+    if (mailbox) {
+      params.mailbox = mailbox
+    }
+    return repository.get('/webmail/mailboxes/', { params })
+  },
+  getUserMailboxQuota(mailbox) {
+    const params = { mailbox }
+    return repository.get('/webmail/mailboxes/quota/', { params })
+  },
+  getUserMailboxUnseen(mailbox) {
+    const params = { mailbox }
+    return repository.get('webmail/mailboxes/unseen/', { params })
+  },
+  // Cheap summary telling whether the content of a mailbox changed
+  getUserMailboxStatus(mailbox) {
+    const params = { mailbox }
+    return repository.get('/webmail/mailboxes/status/', { params })
+  },
+  createUserMailbox(body) {
+    return repository.post('/webmail/mailboxes/', body)
+  },
+  renameUserMailbox(body) {
+    return repository.post('/webmail/mailboxes/rename/', body)
+  },
+  compressUserMailbox(body) {
+    return repository.post('/webmail/mailboxes/compress/', body)
+  },
+  deleteUserMailbox(body) {
+    return repository.post('/webmail/mailboxes/delete/', body)
+  },
+  getSubscriptions() {
+    return repository.get('/webmail/mailboxes/subscriptions/')
+  },
+  updateSubscriptions(changes) {
+    return repository.post('/webmail/mailboxes/subscriptions/', { changes })
+  },
+  emptyUserMailbox(mailbox) {
+    const body = { name: mailbox }
+    return repository.post('/webmail/mailboxes/empty/', body)
+  },
+  getMailboxShares(mailbox) {
+    const params = { mailbox }
+    return repository.get('/webmail/mailboxes/acl/', { params })
+  },
+  // body: { mailbox, grantee, level }
+  shareMailbox(body) {
+    return repository.put('/webmail/mailboxes/acl/', body)
+  },
+  // body: { mailbox, grantee }
+  unshareMailbox(body) {
+    return repository.delete('/webmail/mailboxes/acl/', { data: body })
+  },
+  getMailboxRights(mailbox) {
+    const params = { mailbox }
+    return repository.get('/webmail/mailboxes/rights/', { params })
+  },
+  getShareCandidates() {
+    return repository.get('/webmail/mailboxes/share-candidates/')
+  },
+  getMailboxEmails(mailbox, options) {
+    const params = {
+      mailbox,
+      ...options,
+    }
+    return repository.get(`/webmail/emails/`, { params })
+  },
+  getMailboxThreads(mailbox, options) {
+    const params = {
+      mailbox,
+      ...options,
+    }
+    return repository.get(`/webmail/emails/threads/`, { params })
+  },
+  getThread(mailbox, mailid) {
+    const params = {
+      mailbox,
+      mailid,
+    }
+    return repository.get(`/webmail/emails/thread/`, { params })
+  },
+  getEmailContent(mailbox, mailid, options) {
+    const params = {
+      mailbox,
+      mailid,
+      ...options,
+    }
+    return repository.get(`/webmail/emails/content/`, { params })
+  },
+  getEmailSource(mailbox, mailid) {
+    const params = {
+      mailbox,
+      mailid,
+    }
+    return repository.get(`/webmail/emails/source/`, { params })
+  },
+  getEmailAttachment(mailbox, mailid, partnum) {
+    const params = {
+      mailbox,
+      mailid,
+      partnum,
+    }
+    return repository.get(`/webmail/emails/attachment/`, {
+      params,
+      responseType: 'blob',
+    })
+  },
+  moveSelection(source, destination, selection) {
+    const body = {
+      source,
+      destination,
+      selection,
+    }
+    return repository.post('/webmail/emails/move/', body)
+  },
+  deleteSelection(source, selection) {
+    const body = {
+      source,
+      selection,
+    }
+    return repository.post('/webmail/emails/delete/', body)
+  },
+  markSelectionAsJunk(source, selection) {
+    const body = {
+      source,
+      selection,
+    }
+    return repository.post('/webmail/emails/mark_as_junk/', body)
+  },
+  markSelectionAsNotJunk(source, selection) {
+    const body = {
+      source,
+      selection,
+    }
+    return repository.post('/webmail/emails/mark_as_not_junk/', body)
+  },
+  flagSelection(mailbox, selection, status) {
+    const body = {
+      mailbox,
+      selection,
+      status,
+    }
+    return repository.post('/webmail/emails/flag/', body)
+  },
+  sendEmailFromComposeSession(uid, body) {
+    return repository.post(`/webmail/compose-sessions/${uid}/send/`, body)
+  },
+  // Keep the message in the compose session: sending without data sends it
+  prepareComposeSession(uid, body) {
+    return repository.post(`/webmail/compose-sessions/${uid}/prepare/`, body)
+  },
+  // While the page is being closed: the request outlives it (if small, hence
+  // the prepared message), but the access token can't be refreshed then
+  sendPreparedEmailOnUnload(uid, accessToken) {
+    return fetch(
+      `${repository.defaults.baseURL}/webmail/compose-sessions/${uid}/send/`,
+      {
+        method: 'POST',
+        keepalive: true,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      }
+    )
+  },
+  getComposeSession(uid) {
+    return repository.get(`/webmail/compose-sessions/${uid}/`)
+  },
+  // data: from_draft_message, or forward_mailbox and forward_mailid, to
+  // start the session with the attachments of that message
+  createComposeSession(data = {}) {
+    return repository.post('/webmail/compose-sessions/', data)
+  },
+  // Convert a body when the format of the editor changes (plain or html)
+  convertBody(body, sourceFormat, targetFormat) {
+    return repository.post('/webmail/compose-sessions/convert/', {
+      body: body || '',
+      source_format: sourceFormat,
+      target_format: targetFormat,
+    })
+  },
+  getAllowedSenders() {
+    return repository.get('/webmail/compose-sessions/allowed_senders/')
+  },
+  uploadAttachment(sessionUid, body, onUploadProgress) {
+    return repository.post(
+      `/webmail/compose-sessions/${sessionUid}/attachments/`,
+      body,
+      {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress,
+      }
+    )
+  },
+  saveComposeSession(sessionUid, data) {
+    return repository.post(
+      `/webmail/compose-sessions/${sessionUid}/save/`,
+      data
+    )
+  },
+  removeAttachment(sessionUid, name) {
+    return repository.delete(
+      `/webmail/compose-sessions/${sessionUid}/attachments/${name}/`
+    )
+  },
+  getScheduledMessage(messageId) {
+    return repository.get(`/webmail/scheduled-messages/${messageId}/`)
+  },
+  updateScheduledMessage(messageId, data) {
+    return repository.patch(`/webmail/scheduled-messages/${messageId}/`, data)
+  },
+  deleteScheduledMessage(messageId) {
+    return repository.delete(`/webmail/scheduled-messages/${messageId}/`)
+  },
+}

@@ -1,0 +1,1037 @@
+from datetime import timedelta
+import getpass
+from io import BytesIO
+import os
+import shutil
+import tempfile
+from unittest import mock
+
+from dateutil.relativedelta import relativedelta
+from freezegun import freeze_time
+from rq import SimpleWorker
+
+from django.core import mail
+from django.core.cache.backends.locmem import LocMemCache
+from django.test import override_settings
+from django.urls import reverse
+from django.utils import timezone
+
+import django_rq
+from oauth2_provider.models import get_access_token_model, get_application_model
+
+from modoboa.core import models as core_models
+from modoboa.core.tests import utils
+from modoboa.admin import factories as admin_factories
+from modoboa.lib.tests import ModoAPITestCase
+from modoboa.webmail import factories, jobs, models
+from modoboa.webmail.lib.attachments import ComposeSessionManager
+from modoboa.webmail.mocks import IMAP4Mock
+
+Application = get_application_model()
+AccessToken = get_access_token_model()
+
+DOVEADM_TEST_PATH = utils.get_doveadm_test_path()
+DOVECOT_USER = getpass.getuser()
+
+
+def get_gif():
+    """Return gif."""
+    gif = BytesIO(
+        b"GIF87a\x01\x00\x01\x00\x80\x01\x00\x00\x00\x00ccc,\x00"
+        b"\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    )
+    gif.name = "image.gif"
+    return gif
+
+
+class WebmailTestCase(ModoAPITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        admin_factories.populate_database()
+        cls.user = core_models.User.objects.get(username="user@test.com")
+        cls.application = Application.objects.create(
+            name="Test Application",
+            redirect_uris="http://localhost",
+            user=cls.user,
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+        )
+
+        cls.access_token = AccessToken.objects.create(
+            user=cls.user,
+            scope="read write",
+            expires=timezone.now() + timedelta(seconds=300),
+            token="secret-access-token-key",
+            application=cls.application,
+        )
+
+    def setUp(self):
+        """Connect with a simpler user."""
+        patcher = mock.patch("imaplib.IMAP4")
+        self.mock_imap4 = patcher.start()
+        self.mock_imap4.return_value = IMAP4Mock()
+        self.addCleanup(patcher.stop)
+        # What the server says about itself is cached, and every test
+        # fakes its own server
+        server_info = LocMemCache("webmail-tests", {})
+        server_info.clear()
+        cache_patcher = mock.patch("modoboa.webmail.lib.imaputils.cache", server_info)
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
+        self.set_global_parameter("imap_port", 1435)
+        self.workdir = tempfile.mkdtemp()
+        os.mkdir(f"{self.workdir}/webmail")
+        attachments_root = self.settings(
+            WEBMAIL_ATTACHMENTS_ROOT=f"{self.workdir}/attachments"
+        )
+        attachments_root.enable()
+        self.addCleanup(attachments_root.disable)
+        self.set_global_parameter("update_scheme", False, app="core")
+
+    def tearDown(self):
+        """Cleanup."""
+        shutil.rmtree(self.workdir)
+
+    def authenticate(self):
+        self.client.credentials(Authorization="Bearer " + self.access_token.token)
+
+
+class UserMailboxViewSetTestCase(WebmailTestCase):
+
+    def test_list(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["mailboxes"]), 5)
+
+    def test_quota(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-quota")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get(f"{url}?mailbox=INBOX")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["usage"], -1)
+
+    def test_unseen(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-unseen")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get(f"{url}?mailbox=INBOX")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["counter"], 10)
+
+    def test_status(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-status")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get(f"{url}?mailbox=INBOX")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["unseen"], 10)
+        self.assertIn("state", response.json())
+
+    def test_listings_carry_the_mailbox_state(self):
+        """The state to compare with the status endpoint comes with the list."""
+        self.authenticate()
+        state = self.client.get(
+            f"{reverse('v2:webmail-mailbox-status')}?mailbox=INBOX"
+        ).json()["state"]
+        for name in ("v2:webmail-email-list", "v2:webmail-email-threads"):
+            response = self.client.get(f"{reverse(name)}?mailbox=INBOX")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["state"], state)
+            # The mailbox counter needs no request of its own
+            self.assertEqual(response.json()["unseen"], 10)
+
+    def test_list_unseen_counters(self):
+        """Unseen counters must be computed for every selectable mailbox.
+
+        Even a mailbox flagged \\UnMarked (no *recent* activity since the
+        last SELECT) can hold unseen messages and must expose its counter.
+        \\Noselect mailboxes cannot be queried with STATUS and must be
+        skipped.
+        """
+
+        class IMAP4MockWithFolders(IMAP4Mock):
+            def _simple_command(self, name, *args, **kwargs):
+                if name == "LIST":
+                    self.untagged_responses["LIST"] = [
+                        b'(\\Subscribed \\HasNoChildren) "." "INBOX"',
+                        b'(\\Subscribed \\UnMarked \\HasNoChildren) "." "Archive"',
+                        # Unsubscribed but kept because it has children; its
+                        # \\Noselect flag means it must not be queried.
+                        b'(\\Noselect \\HasChildren) "." "Parent"',
+                    ]
+                    return "OK", None
+                if name == "STATUS":
+                    target = args[0]
+                    if isinstance(target, bytes):
+                        target = target.decode()
+                    count = 10 if "INBOX" in target else 3
+                    self.untagged_responses["STATUS"] = [
+                        f"STATUS x (UNSEEN {count})".encode()
+                    ]
+                    return "OK", None
+                return super()._simple_command(name, *args, **kwargs)
+
+        self.mock_imap4.return_value = IMAP4MockWithFolders()
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        mailboxes = {mb["name"]: mb for mb in response.json()["mailboxes"]}
+        # \\UnMarked mailbox with unseen messages: counter must be present
+        # (the previous heuristic skipped it).
+        self.assertEqual(mailboxes["Archive"]["unseen"], 3)
+        self.assertEqual(mailboxes["INBOX"]["unseen"], 10)
+        # \\Noselect mailbox: not queried, counter stays 0.
+        self.assertEqual(mailboxes["Parent"]["unseen"], 0)
+
+    def test_create(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-list")
+        body = {"name": "Test"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 201)
+        body = {"parent": "Test", "name": "Test"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_rename(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-rename")
+        body = {"name": "Test renamed", "oldname": "Test"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        # Top-level folders send an empty parent_mailbox: it must not be
+        # rejected as blank.
+        body = {"name": "Test renamed", "oldname": "Test", "parent_mailbox": ""}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+
+    def test_compress(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-compress")
+        body = {"name": "INBOX"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 204)
+
+    def test_empty(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-empty")
+        body = {"name": "INBOX"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 404)
+        body = {"name": "Trash"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 204)
+
+    def test_delete(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-delete")
+        body = {"name": "Test"}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 204)
+
+    def test_get_subscriptions(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-subscriptions")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        content = response.json()
+        # Every folder is returned as a flat list, children right after
+        # their parent.
+        self.assertEqual(
+            content["mailboxes"],
+            [
+                {"name": "INBOX", "subscribed": True},
+                {"name": "Test", "subscribed": True},
+                {"name": "Test/Sub", "subscribed": False},
+                {"name": "Test-Other", "subscribed": False},
+            ],
+        )
+        self.assertEqual(content["hdelimiter"], "/")
+
+    def test_update_subscriptions(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-subscriptions")
+        body = {
+            "changes": [
+                {"name": "Test/Sub", "subscribed": True},
+                {"name": "Test", "subscribed": False},
+            ]
+        }
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 204)
+
+    def test_update_subscriptions_invalid(self):
+        self.authenticate()
+        url = reverse("v2:webmail-mailbox-subscriptions")
+        response = self.client.post(url, {"changes": [{}]}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+
+class UserEmailViewSetTestCase(WebmailTestCase):
+
+    def test_listmailbox(self):
+        """Check listmailbox action."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        content = response.json()
+        self.assertEqual(content["count"], 1)
+        self.assertEqual(
+            content["results"][0]["from_address"]["address"],
+            "nguyen.antoine@wanadoo.fr",
+        )
+
+        response = self.client.get(f"{url}?search=Réception")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            content["results"][0]["from_address"]["address"],
+            "nguyen.antoine@wanadoo.fr",
+        )
+
+    def test_getmailsource(self):
+        """Try to display a message's source."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-source")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=133872")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Message-ID", response.json()["source"])
+
+    def test_imap_injection_rejected(self):
+        """CRLF / malformed identifiers in GET params must be rejected.
+
+        These would otherwise be concatenated into IMAP commands by
+        imaplib (CWE-93/CWE-74).
+        """
+        self.authenticate()
+        payload = "1%0d%0aA999%20UID%20STORE%201%20+FLAGS%20(\\Deleted)"
+
+        # mailid on content / source
+        for name in ["content", "source"]:
+            url = reverse(f"v2:webmail-email-{name}")
+            response = self.client.get(f"{url}?mailbox=INBOX&mailid={payload}")
+            self.assertEqual(response.status_code, 400)
+
+        # mailid and partnum on attachment
+        url = reverse("v2:webmail-email-attachment")
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid={payload}&partnum=2")
+        self.assertEqual(response.status_code, 400)
+        response = self.client.get(
+            f"{url}?mailbox=INBOX&mailid=1&partnum=2%5d%20BODY%5b%5d"
+        )
+        self.assertEqual(response.status_code, 400)
+
+        # search on list
+        url = reverse("v2:webmail-email-list")
+        response = self.client.get(f"{url}?mailbox=INBOX&search={payload}")
+        self.assertEqual(response.status_code, 400)
+
+    def test_search_quote_is_escaped(self):
+        """A double quote in search must not break the IMAP quoted string."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-list")
+        response = self.client.get(f'{url}?mailbox=INBOX&search=a"b')
+        # Request succeeds (no injection): the quote is escaped, not rejected.
+        self.assertEqual(response.status_code, 200)
+
+    def test_move(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-move")
+        body = {"source": "INBOX", "destination": "Junk", "selection": [1]}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 1)
+
+        body = {"source": "INBOX", "selection": [1]}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_delete(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-delete")
+        body = {"source": "INBOX", "selection": [1]}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 1)
+
+        body = {"source": "INBOX", "selection": ["truc"]}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 0)
+
+    def test_mark_as_junk(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-mark-as-junk")
+        body = {"source": "INBOX", "selection": [1]}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 1)
+
+    def test_mark_as_not_junk(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-mark-as-not-junk")
+        body = {"source": "INBOX", "selection": [1]}
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 1)
+
+    def test_flag(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-flag")
+        for status in ["read", "unread", "flagged", "unflagged"]:
+            body = {"mailbox": "INBOX", "selection": [1], "status": status}
+            response = self.client.post(url, body, format="json")
+            self.assertEqual(response.status_code, 200)
+
+    def test_content(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-content")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+
+        # Empty email
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=33")
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["body"], None)
+
+        # Reply modifier
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=46931&context=reply")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["subject"].startswith("Re:"))
+
+        # Forward modifier
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=46932&context=forward")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["subject"].startswith("Fwd:"))
+
+        # Scheduled message
+        response = self.client.get(f"{url}?mailbox=Scheduled&mailid=33")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("scheduled_datetime", response.json())
+
+    def test_content_reply_to(self):
+        """Every Reply-To address is returned as a structured address."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-content")
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=46933&context=reply")
+        self.assertEqual(response.status_code, 200)
+        reply_to = response.json()["reply_to"]
+        self.assertEqual(
+            [rcpt["address"] for rcpt in reply_to],
+            ["support@example.test", "other@example.test"],
+        )
+        self.assertEqual(reply_to[0]["name"], "Support")
+
+    def test_content_headers(self):
+        """The message view gets every header its header block displays."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-content")
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=46933")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(
+            [rcpt["address"] for rcpt in data["reply_to"]],
+            ["support@example.test", "other@example.test"],
+        )
+        self.assertTrue(data["date_full"])
+
+    def test_content_reply_escapes_sender_name(self):
+        """A sender name containing HTML must not be injected as markup."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-content")
+        response = self.client.get(
+            f"{url}?mailbox=INBOX&mailid=46934&context=reply&dformat=html"
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["body"]
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", body)
+        self.assertNotIn("<img", body)
+
+    def test_content_edit_context(self):
+        """Drafts are returned with a raw body, ready for the editor."""
+        self.authenticate()
+        url = reverse("v2:webmail-email-content")
+        response = self.client.get(
+            f"{url}?mailbox=Drafts&mailid=46931&context=edit&dformat=plain"
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["body"]
+        self.assertNotIn("<pre>", body)
+        self.assertEqual(body, "This is a test message.")
+
+    def test_attachment(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-attachment")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get(f"{url}?mailbox=INBOX&mailid=3444&partnum=2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["Content-Disposition"], 'attachment; filename="attachment"'
+        )
+
+
+class ComposeSessionViewSetTestCase(WebmailTestCase):
+
+    def _create_compose_session(self):
+        url = reverse("v2:webmail-compose-session-list")
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("uid", response.json())
+        return response.json()["uid"]
+
+    def test_create(self):
+        self.authenticate()
+        self._create_compose_session()
+
+    def test_create_from_draft(self):
+        self.authenticate()
+        data = {"from_draft_message": 3444}
+        url = reverse("v2:webmail-compose-session-list")
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+        uid = response.json()["uid"]
+        manager = ComposeSessionManager(self.user.username)
+        content = manager.get_content(uid)
+        self.assertEqual(len(content["attachments"]), 1)
+        # The attachment must be stored decoded, not as base64 text
+        tmpname = content["attachments"][0]["tmpname"]
+        with open(f"{self.workdir}/attachments/{tmpname}", "rb") as fp:
+            self.assertTrue(fp.read().startswith(b"%PDF-1.4"))
+
+    def test_get(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-detail", args=[uid])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+    def test_get_allowed_senders(self):
+        self.authenticate()
+        url = reverse("v2:webmail-compose-session-allowed-senders")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 2)
+
+    def test_send_rejects_spoofed_sender(self):
+        """A user cannot send with a From address they do not own."""
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        mail.outbox = []
+        response = self.client.post(
+            url,
+            {
+                "sender": "victim@example.test",
+                "to": ["test@example.test"],
+                "subject": "spoofed",
+                "body": "Test",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("sender", response.json())
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_attachments(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+
+        manager = ComposeSessionManager(self.user.username)
+        self.set_global_parameters({"max_attachment_size": "10"})
+        url = reverse("v2:webmail-compose-session-attachments", args=[uid])
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.post(url, {"attachment": get_gif()})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Attachment is too big", response.json()["attachment"][0])
+
+        self.set_global_parameters({"max_attachment_size": "10K"})
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.post(url, {"attachment": get_gif()})
+        self.assertEqual(response.status_code, 200)
+        content = manager.get_content(uid)
+        self.assertEqual(len(content["attachments"]), 1)
+        name = content["attachments"][0]["tmpname"]
+        path = f"{self.workdir}/attachments/{name}"
+        self.assertTrue(os.path.exists(path))
+
+        url = reverse("v2:webmail-compose-session-delete-attachment", args=[uid, name])
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(os.path.exists(path))
+
+    def test_delete_attachment(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+
+        url = reverse(
+            "v2:webmail-compose-session-delete-attachment", args=[uid, "unknown"]
+        )
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.delete(url)
+        self.assertEqual(response.status_code, 404)
+
+    def test_save(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        # Upload an attachment
+        url = reverse("v2:webmail-compose-session-attachments", args=[uid])
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.post(url, {"attachment": get_gif()})
+            # Save the message as draft
+            url = reverse("v2:webmail-compose-session-save", args=[uid])
+            response = self.client.post(
+                url,
+                {
+                    "sender": self.user.email,
+                    "to": ["test@example.test"],
+                    "subject": "test",
+                    "body": "Test",
+                },
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["mailid"], 11)
+
+    def test_save_existing_draft(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-save", args=[uid])
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test",
+                "body": "Test",
+                "mailid": 11,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_save_keeps_bcc(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-save", args=[uid])
+        with mock.patch(
+            "modoboa.webmail.lib.imaputils.IMAPconnector.push_mail", return_value=12
+        ) as push_mail:
+            response = self.client.post(
+                url,
+                {
+                    "sender": self.user.email,
+                    "to": ["test@example.test"],
+                    "bcc": ["hidden@example.test"],
+                    "subject": "test",
+                    "body": "Test",
+                },
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["mailid"], 12)
+        self.assertEqual(push_mail.call_args.args[1]["Bcc"], "hidden@example.test")
+
+    def test_send_deletes_draft(self):
+        self.authenticate()
+        data = {
+            "sender": self.user.email,
+            "to": ["test@example.test"],
+            "subject": "test",
+            "body": "Test",
+        }
+        with mock.patch(
+            "modoboa.webmail.lib.imaputils.IMAPconnector.delete_mail"
+        ) as delete_mail:
+            # Not composed from a draft: nothing to delete
+            uid = self._create_compose_session()
+            url = reverse("v2:webmail-compose-session-send", args=[uid])
+            response = self.client.post(url, data, format="json")
+            self.assertEqual(response.status_code, 204)
+            delete_mail.assert_not_called()
+
+            uid = self._create_compose_session()
+            url = reverse("v2:webmail-compose-session-send", args=[uid])
+            response = self.client.post(url, {**data, "mailid": 11}, format="json")
+            self.assertEqual(response.status_code, 204)
+            delete_mail.assert_called_once_with("Drafts", 11)
+
+    def test_prepare_and_send(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        send_url = reverse("v2:webmail-compose-session-send", args=[uid])
+        # Nothing prepared: a send request without data is invalid
+        response = self.client.post(send_url, {}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+        url = reverse("v2:webmail-compose-session-prepare", args=[uid])
+        # Checked before being kept
+        response = self.client.post(url, {"subject": "test"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "prepared",
+                "body": "Test",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 0)
+
+        response = self.client.post(send_url, {}, format="json")
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, "prepared")
+
+    def test_send(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+
+        # Upload an attachment
+        url = reverse("v2:webmail-compose-session-attachments", args=[uid])
+        with self.settings(MEDIA_ROOT=self.workdir):
+            response = self.client.post(url, {"attachment": get_gif()})
+
+            # Send the message
+            url = reverse("v2:webmail-compose-session-send", args=[uid])
+            response = self.client.post(
+                url,
+                {
+                    "sender": self.user.email,
+                    "to": ["test@example.test"],
+                    "subject": "test",
+                    "body": "Test",
+                },
+                format="json",
+            )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].from_email, "user@test.com")
+
+        # Try to send an email using HTML format
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+
+        self.user.first_name = "Antoine"
+        self.user.last_name = "Nguyen"
+        self.user.parameters.set_value("editor", "html")
+        self.user.save()
+        mail.outbox = []
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test",
+                "body": "<p>Test</p>",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].from_email, '"Antoine Nguyen" <user@test.com>')
+
+    @mock.patch("modoboa.webmail.lib.sendmail.mail.get_connection")
+    def test_send_with_dsn(self, mock_get_conn):
+        mock_smtp = mock.MagicMock()
+        mock_connection = mock.MagicMock()
+        mock_connection.connection = mock_smtp
+        mock_connection.__enter__ = mock.Mock(return_value=mock_connection)
+        mock_connection.__exit__ = mock.Mock(return_value=False)
+        mock_get_conn.return_value = mock_connection
+
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test DSN",
+                "body": "Test",
+                "request_dsn": True,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        mock_connection.open.assert_called_once()
+        mock_smtp.sendmail.assert_called_once()
+        call_kwargs = mock_smtp.sendmail.call_args
+        self.assertEqual(call_kwargs[1]["mail_options"], ["RET=HDRS"])
+        self.assertEqual(
+            call_kwargs[1]["rcpt_options"], ["NOTIFY=SUCCESS,FAILURE,DELAY"]
+        )
+
+    def test_send_with_mdn(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test MDN",
+                "body": "Test",
+                "request_mdn": True,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("Disposition-Notification-To", mail.outbox[0].extra_headers)
+        self.assertEqual(
+            mail.outbox[0].extra_headers["Disposition-Notification-To"],
+            "user@test.com",
+        )
+
+    @mock.patch("modoboa.webmail.lib.sendmail.mail.get_connection")
+    def test_send_with_dsn_and_mdn(self, mock_get_conn):
+        mock_smtp = mock.MagicMock()
+        mock_connection = mock.MagicMock()
+        mock_connection.connection = mock_smtp
+        mock_connection.__enter__ = mock.Mock(return_value=mock_connection)
+        mock_connection.__exit__ = mock.Mock(return_value=False)
+        mock_get_conn.return_value = mock_connection
+
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test both",
+                "body": "Test",
+                "request_dsn": True,
+                "request_mdn": True,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        # Verify DSN options were used
+        mock_smtp.sendmail.assert_called_once()
+        call_kwargs = mock_smtp.sendmail.call_args
+        self.assertEqual(call_kwargs[1]["mail_options"], ["RET=HDRS"])
+        self.assertEqual(
+            call_kwargs[1]["rcpt_options"], ["NOTIFY=SUCCESS,FAILURE,DELAY"]
+        )
+        # Verify MDN header is present in the message data
+        message_data = call_kwargs[0][2]  # third positional arg
+        self.assertIn(b"Disposition-Notification-To", message_data)
+
+    @override_settings(
+        DOVEADM_LOOKUP_PATH=[DOVEADM_TEST_PATH], DOVECOT_USER=DOVECOT_USER
+    )
+    def test_schedule_and_send(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        # Upload an attachment
+        url = reverse("v2:webmail-compose-session-attachments", args=[uid])
+        with self.settings(MEDIA_ROOT=self.workdir):
+            self.client.post(url, {"attachment": get_gif()})
+            # Schedule the message too early
+            scheduled_datetime = timezone.now()
+            url = reverse("v2:webmail-compose-session-send", args=[uid])
+            response = self.client.post(
+                url,
+                {
+                    "sender": self.user.email,
+                    "to": ["test@example.test"],
+                    "subject": "test",
+                    "body": "Test",
+                    "scheduled_datetime": scheduled_datetime.isoformat(),
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("scheduled_datetime", response.json())
+
+            scheduled_datetime = timezone.now() + relativedelta(hours=1)
+            response = self.client.post(
+                url,
+                {
+                    "sender": self.user.email,
+                    "to": ["test@example.test"],
+                    "cc": ["cc@example.test"],
+                    "subject": "test",
+                    "body": "Test",
+                    "scheduled_datetime": scheduled_datetime.isoformat(),
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, 204)
+            self.assertEqual(len(mail.outbox), 0)
+            self.assertEqual(models.ScheduledMessage.objects.count(), 1)
+            self.assertEqual(models.MessageAttachment.objects.count(), 1)
+
+            with freeze_time(scheduled_datetime + relativedelta(minutes=1)):
+                jobs.send_scheduled_messages()
+                queue = django_rq.get_queue("modoboa")
+                worker = SimpleWorker([queue], connection=queue.connection)
+                worker.work(burst=True)
+
+            self.assertEqual(len(mail.outbox), 1)
+            self.assertEqual(models.ScheduledMessage.objects.count(), 0)
+            self.assertEqual(models.MessageAttachment.objects.count(), 0)
+
+    def test_schedule_with_too_long_values(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        data = {
+            "sender": self.user.email,
+            "to": ["test@example.test"],
+            "subject": "s" * 256,
+            "in_reply_to": f"<{'i' * 199}@example.test>",
+            "body": "Test",
+            "scheduled_datetime": (timezone.now() + relativedelta(hours=1)).isoformat(),
+        }
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("subject", response.json())
+        self.assertIn("in_reply_to", response.json())
+        self.assertEqual(models.ScheduledMessage.objects.count(), 0)
+
+        # Sent right away, the message has no such limit
+        del data["scheduled_datetime"]
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+
+    @override_settings(
+        DOVEADM_LOOKUP_PATH=[DOVEADM_TEST_PATH], DOVECOT_USER=DOVECOT_USER
+    )
+    def test_schedule_with_mdn(self):
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        scheduled_datetime = timezone.now() + relativedelta(hours=1)
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test MDN scheduled",
+                "body": "Test",
+                "scheduled_datetime": scheduled_datetime.isoformat(),
+                "request_mdn": True,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        sched_msg = models.ScheduledMessage.objects.first()
+        self.assertTrue(sched_msg.request_mdn)
+        self.assertFalse(sched_msg.request_dsn)
+
+        with freeze_time(scheduled_datetime + relativedelta(minutes=1)):
+            jobs.send_scheduled_messages()
+            queue = django_rq.get_queue("modoboa")
+            worker = SimpleWorker([queue], connection=queue.connection)
+            worker.work(burst=True)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("Disposition-Notification-To", mail.outbox[0].extra_headers)
+
+    @override_settings(
+        DOVEADM_LOOKUP_PATH=[DOVEADM_TEST_PATH], DOVECOT_USER=DOVECOT_USER
+    )
+    @mock.patch("modoboa.webmail.lib.sendmail.mail.get_connection")
+    def test_schedule_with_dsn(self, mock_get_conn):
+        mock_smtp = mock.MagicMock()
+        mock_connection = mock.MagicMock()
+        mock_connection.connection = mock_smtp
+        mock_connection.__enter__ = mock.Mock(return_value=mock_connection)
+        mock_connection.__exit__ = mock.Mock(return_value=False)
+        mock_get_conn.return_value = mock_connection
+
+        self.authenticate()
+        uid = self._create_compose_session()
+        url = reverse("v2:webmail-compose-session-send", args=[uid])
+        scheduled_datetime = timezone.now() + relativedelta(hours=1)
+        response = self.client.post(
+            url,
+            {
+                "sender": self.user.email,
+                "to": ["test@example.test"],
+                "subject": "test DSN scheduled",
+                "body": "Test",
+                "scheduled_datetime": scheduled_datetime.isoformat(),
+                "request_dsn": True,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 204)
+        sched_msg = models.ScheduledMessage.objects.first()
+        self.assertTrue(sched_msg.request_dsn)
+
+        with freeze_time(scheduled_datetime + relativedelta(minutes=1)):
+            jobs.send_scheduled_messages()
+            queue = django_rq.get_queue("modoboa")
+            worker = SimpleWorker([queue], connection=queue.connection)
+            worker.work(burst=True)
+
+        mock_connection.open.assert_called_once()
+        mock_smtp.sendmail.assert_called_once()
+        call_kwargs = mock_smtp.sendmail.call_args
+        self.assertEqual(call_kwargs[1]["mail_options"], ["RET=HDRS"])
+        self.assertEqual(
+            call_kwargs[1]["rcpt_options"], ["NOTIFY=SUCCESS,FAILURE,DELAY"]
+        )
+
+
+@override_settings(DOVEADM_LOOKUP_PATH=[DOVEADM_TEST_PATH], DOVECOT_USER=DOVECOT_USER)
+class ScheduledMessageViewSetTestCase(WebmailTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.message = factories.ScheduledMessageFactory(
+            account=self.user, scheduled_datetime=timezone.now()
+        )
+
+    def test_listmailbox(self):
+        self.authenticate()
+        url = reverse("v2:webmail-email-list")
+        response = self.client.get(f"{url}?mailbox=Scheduled")
+        self.assertEqual(response.status_code, 200)
+        content = response.json()
+        self.assertEqual(content["count"], 1)
+        self.assertEqual(content["results"][0]["scheduled_id"], 1123)
+        self.assertIn("scheduled_datetime_raw", content["results"][0])
+
+    def test_delete(self):
+        self.authenticate()
+        url = reverse("v2:webmail-scheduled-message-detail", args=[self.message.id])
+        with mock.patch("modoboa.lib.dovecot.get_dovecot_backend") as get_backend:
+            response = self.client.delete(url)
+        move_message = get_backend.return_value.move_message
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(models.ScheduledMessage.objects.count(), 0)
+        self.assertEqual(move_message.call_args.args[1], "Trash")
+
+    def test_update(self):
+        self.authenticate()
+        url = reverse("v2:webmail-scheduled-message-detail", args=[self.message.id])
+        data = {"scheduled_datetime": timezone.now() + relativedelta(days=1)}
+        response = self.client.patch(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.imap_uid, 11)

@@ -1,0 +1,150 @@
+import copy
+
+from django.conf import settings
+from django.test import TestCase
+from django.urls import reverse
+
+
+class ViewsTestCase(TestCase):
+
+    databases = "__all__"
+
+    def test_autoconfig(self):
+        url = reverse("autoconfig:autoconfig")
+
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"<username>%EMAILADDRESS%</username>", resp.content)
+
+    def test_autoconfig_empty_emailaddress(self):
+        url = reverse("autoconfig:autoconfig")
+
+        resp = self.client.get(f"{url}?emailaddress=")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"<username>%EMAILADDRESS%</username>", resp.content)
+
+    def test_autoconfig_with_emailaddress(self):
+        url = reverse("autoconfig:autoconfig")
+
+        resp = self.client.get(f"{url}?emailaddress=test@test.com")
+        self.assertEqual(resp.status_code, 200)
+
+        self.assertIn(b'<emailProvider id="test.com">', resp.content)
+
+    def test_autoconfig_domain_from_host(self):
+        """Thunderbird Android never sends the emailaddress parameter."""
+        url = reverse("autoconfig:autoconfig")
+
+        with self.settings(ALLOWED_HOSTS=["autoconfig.example.co.uk"]):
+            resp = self.client.get(url, HTTP_HOST="autoconfig.example.co.uk")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'<emailProvider id="example.co.uk">', resp.content)
+        self.assertIn(b"<domain>example.co.uk</domain>", resp.content)
+
+    def test_autoconfig_socket_type_case(self):
+        """Thunderbird only accepts SSL, STARTTLS and plain (case-sensitive)."""
+        url = reverse("autoconfig:autoconfig")
+
+        conn_settings = copy.deepcopy(settings.EMAIL_CLIENT_CONNECTION_SETTINGS)
+        conn_settings["imap"]["SOCKET_TYPE"] = "ssl"
+        conn_settings["smtp"]["SOCKET_TYPE"] = "starttls"
+        with self.settings(EMAIL_CLIENT_CONNECTION_SETTINGS=conn_settings):
+            resp = self.client.get(url)
+        self.assertIn(b"<socketType>SSL</socketType>", resp.content)
+        self.assertIn(b"<socketType>STARTTLS</socketType>", resp.content)
+
+    def test_autodiscover(self):
+        url = reverse("autoconfig:autodiscover")
+
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 404)
+
+        resp = self.client.post(url, {"EmailAddress": "test@test.com"})
+        self.assertEqual(resp.status_code, 200)
+
+        self.assertIn(b"<LoginName>test@test.com", resp.content)
+
+    def test_autodiscover_with_server_placeholders(self):
+        url = reverse("autoconfig:autodiscover")
+
+        conn_settings = copy.deepcopy(settings.EMAIL_CLIENT_CONNECTION_SETTINGS)
+        conn_settings["imap"]["HOSTNAME"] = "mail.%EMAILDOMAIN%"
+        conn_settings["smtp"]["HOSTNAME"] = "smtp.%EMAILDOMAIN%"
+        with self.settings(EMAIL_CLIENT_CONNECTION_SETTINGS=conn_settings):
+            resp = self.client.post(url, {"EmailAddress": "test@test.example"})
+            self.assertEqual(resp.status_code, 200)
+
+            self.assertIn(b"<Server>mail.test.example</Server>", resp.content)
+            self.assertIn(b"<Server>smtp.test.example</Server>", resp.content)
+
+    def test_autodiscover_real_outlook_xml_body(self):
+        """Real Outlook clients POST an XML body, not form data."""
+        url = reverse("autoconfig:autodiscover")
+        body = b"""<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">
+  <Request>
+    <EMailAddress>test@test.com</EMailAddress>
+    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+  </Request>
+</Autodiscover>"""
+        resp = self.client.post(url, data=body, content_type="text/xml")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"<LoginName>test@test.com", resp.content)
+
+        resp = self.client.post(url, data=b"not xml", content_type="text/xml")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_autodiscover_empty_emailaddress_xml_element(self):
+        url = reverse("autoconfig:autodiscover")
+        body = b"""<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">
+  <Request>
+    <EMailAddress></EMailAddress>
+    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+  </Request>
+</Autodiscover>"""
+
+        resp = self.client.post(url, data=body, content_type="text/xml")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_autodiscover_empty_emailaddress_form_field(self):
+        url = reverse("autoconfig:autodiscover")
+
+        resp = self.client.post(url, {"EmailAddress": ""})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_mobileconfig(self):
+        url = reverse("autoconfig:mobileconfig")
+
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 404)
+
+        resp = self.client.get(f"{url}?emailaddress=test@test.com")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_mobileconfig_with_server_placeholders(self):
+        url = reverse("autoconfig:mobileconfig")
+
+        conn_settings = copy.deepcopy(settings.EMAIL_CLIENT_CONNECTION_SETTINGS)
+        conn_settings["imap"]["HOSTNAME"] = "mail.%EMAILDOMAIN%"
+        conn_settings["smtp"]["HOSTNAME"] = "smtp.%EMAILDOMAIN%"
+        with self.settings(EMAIL_CLIENT_CONNECTION_SETTINGS=conn_settings):
+            resp = self.client.get(f"{url}?emailaddress=test@test.example")
+            self.assertEqual(resp.status_code, 200)
+
+            self.assertIn(b"<string>mail.test.example</string>", resp.content)
+            self.assertIn(b"<string>smtp.test.example</string>", resp.content)
+
+    def test_autodiscover_xxe_entity_not_resolved(self):
+        """Ensure XXE entity expansion is blocked by defusedxml (#1556)."""
+        url = reverse("autoconfig:autodiscover")
+        body = (
+            b'<?xml version="1.0"?>'
+            b'<!DOCTYPE foo [<!ENTITY xxe "INJECTED">]>'
+            b"<Autodiscover><Request>"
+            b"<EMailAddress>&xxe;</EMailAddress>"
+            b"</Request></Autodiscover>"
+        )
+        resp = self.client.post(url, data=body, content_type="text/xml")
+        # Entity is not resolved, so EMailAddress is not a valid address → 404
+        self.assertEqual(resp.status_code, 404)

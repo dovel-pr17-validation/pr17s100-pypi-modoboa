@@ -1,0 +1,17 @@
+version: 2
+
+build:
+  os: ubuntu-lts-latest
+  tools:
+    nodejs: "latest"
+  jobs:
+    install:
+      - npm install --prefix doc-ng --force
+    build:
+      html:
+        # The site was created by running `vitepress init`
+        # and following the official guide
+        # https://vitepress.dev/guide/getting-started
+        - ./doc-ng/node_modules/.bin/vitepress build doc-ng
+        - mkdir -p $READTHEDOCS_OUTPUT/
+        - mv doc-ng/dist $READTHEDOCS_OUTPUT/html

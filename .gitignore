@@ -1,0 +1,55 @@
+.*~$
+*.pyc
+*.mo
+*.db
+modoboa.egg-info
+DEV
+.idea
+.ropeproject
+modoboa.iml
+.tox
+.eggs/
+modoboa_test
+bin/instance
+.coverage
+./build/
+build/
+dist/
+modoboa/frontend_dist
+/frontend_dist/
+# JS stuff
+node_modules
+yarn-error.log
+npm-debug.log*
+/static/dist
+/frontend/webpack-stats.json
+/frontend/src/translations.json
+/frontend/.__mf__temp/
+/frontend/.npm/
+doc-ng/.vitepress/cache/
+doc-ng/.vitepress/dist/
+doc-ng/pnpm-lock.yaml
+
+# TOX stuff
+test_project/modoboa.db
+test_project/frontend
+
+/.project
+/.pydevproject
+
+# Misc
+.ash_history
+modoboa.kdev4
+.kateproject
+test_project/cert.crt
+test_project/cert.key
+test_project/envfile
+test_project/media
+test_project/webmail_attachments
+
+# Docker
+docker/collections
+docker/redis
+docker/mariadb
+
+*.djcache

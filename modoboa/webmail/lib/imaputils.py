@@ -1,0 +1,1704 @@
+"""Extra IMAPv4 utilities."""
+
+import email
+import email.utils
+import hashlib
+import imaplib
+import logging
+import re
+import ssl
+import time
+import urllib.parse
+
+from django.conf import settings
+from django.core.cache import cache
+from django.utils.encoding import smart_str
+from django.utils.translation import gettext as _
+
+from modoboa.core.models import User
+from modoboa.lib import imap_utf7  # noqa
+from modoboa.lib import oauth2
+from modoboa.lib import u2u_decode
+from modoboa.lib.exceptions import InternalError
+from modoboa.parameters import tools as param_tools
+from modoboa.webmail import constants
+
+from ..exceptions import (
+    ImapError,
+    InvalidImapArgument,
+    MailboxOperationError,
+    WebmailInternalError,
+)
+from . import imapheader
+from .fetch_parser import FetchResponseParser
+
+logger = logging.getLogger("modoboa.webmail")
+
+# imaplib.Debug = 4
+
+# Default timeout (in seconds) of IMAP socket operations. Without it, a
+# server that never answers blocks the worker forever.
+DEFAULT_IMAP_TIMEOUT = 30
+
+# workaround for the "got more than 10000 bytes" exception. MAXLINE
+# value set to 1M, as on latest python versions.
+MAXLINE = 1000000
+if hasattr(imaplib, "_MAXLINE") and imaplib._MAXLINE < MAXLINE:
+    imaplib._MAXLINE = MAXLINE
+
+# Keep a reference to the real exception class: tests replace
+# imaplib.IMAP4 with a mock, which would also replace IMAP4.error.
+IMAP4Error = imaplib.IMAP4.error
+
+# How long what the server says about itself (capabilities, namespaces)
+# is kept: it hardly ever changes, and asking costs a round trip on
+# every request.
+SERVER_INFO_CACHE_TIMEOUT = 3600
+
+
+def server_info_key(address: str, port: int, user: str, name: str) -> str:
+    """Cache key of an information the server gives about a user.
+
+    The name is hashed: cache backends restrict the characters and
+    the length of keys.
+    """
+    digest = hashlib.sha256(f"{address}:{port}:{user}".encode()).hexdigest()
+    return f"modoboa.webmail.{name}.{digest}"
+
+
+# A message UID set: one or more positive integers separated by commas.
+UID_RE = re.compile(r"^[0-9]+(?:,[0-9]+)*$")
+# A MIME part number: dot-separated positive integers (e.g. "1", "2.1").
+PARTNUM_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
+
+# A THREAD response only contains UIDs, parenthesis and spaces.
+THREAD_RESPONSE_RE = re.compile(r"^[0-9() ]*$")
+THREAD_TOKEN_RE = re.compile(r"[()]|[0-9]+")
+
+
+def validate_imap_uid(value):
+    """Ensure a message UID (set) is safe to pass to imaplib.
+
+    Prevents IMAP command injection (CWE-93/CWE-74): imaplib does not
+    reject CRLF or quote command arguments, so any user-controlled value
+    reaching a command must be strictly validated first.
+    """
+    if value is None or not UID_RE.match(str(value)):
+        raise InvalidImapArgument(_("Invalid message identifier"))
+    return str(value)
+
+
+def validate_imap_partnum(value):
+    """Ensure a MIME part number is safe to pass to imaplib."""
+    if value is None or not PARTNUM_RE.match(str(value)):
+        raise InvalidImapArgument(_("Invalid part number"))
+    return str(value)
+
+
+def escape_search_pattern(pattern: str) -> str:
+    """Escape a user pattern before placing it in an IMAP quoted string.
+
+    Control characters (including CR/LF) cannot appear in an IMAP
+    quoted string and would allow command injection, so they are
+    rejected. Backslashes and double quotes are backslash-escaped as
+    required by RFC 3501.
+    """
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in pattern):
+        raise InvalidImapArgument(_("Invalid search pattern"))
+    return pattern.replace("\\", "\\\\").replace('"', '\\"')
+
+
+# A quoted string or an atom of an ACL/MYRIGHTS response
+ACL_TOKEN_RE = re.compile(rb'"((?:[^"\\]|\\.)*)"|([^\s"]+)')
+# Announces a literal, sent by imaplib along the text that precedes it
+LITERAL_SIZE_RE = re.compile(rb"\{\d+\}$")
+
+
+def parse_acl_response(data: list) -> list[str]:
+    """Split an untagged ACL or MYRIGHTS response into its tokens.
+
+    Identifiers with 8-bit characters are sent as literals: imaplib
+    returns them as (preceding text, literal) tuples.
+    """
+    tokens = []
+    for item in data or []:
+        literal = None
+        if isinstance(item, tuple):
+            item, literal = item
+            item = LITERAL_SIZE_RE.sub(b"", item)
+        if not isinstance(item, bytes):
+            continue
+        for match in ACL_TOKEN_RE.finditer(item):
+            quoted, atom = match.groups()
+            if quoted is not None:
+                atom = re.sub(rb"\\(.)", rb"\1", quoted)
+            tokens.append(atom.decode())
+        if literal is not None:
+            tokens.append(literal.decode())
+    if not tokens:
+        raise ImapError(_("Unexpected response from the IMAP server"))
+    return tokens
+
+
+def quote_string(value: str) -> bytes:
+    """Return a value as an IMAP quoted string (RFC 3501).
+
+    Backslashes and double quotes are escaped, so that a crafted value
+    can't break out of the string and inject extra command arguments.
+    Control characters can't be quoted: they are rejected.
+    """
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise InvalidImapArgument(_("Invalid IMAP argument"))
+    encoded = value.encode()
+    return b'"' + encoded.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+
+
+def quote_mailbox_name(name: str) -> bytes:
+    """Encode a mailbox name to imap4-utf-7 and return it as a quoted string.
+
+    Double quotes and backslashes are left untouched by the imap4-utf-7
+    codec, so they must be backslash-escaped, otherwise a crafted name
+    could break out of the quoted string and inject extra command
+    arguments. Control characters are rejected.
+    """
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in name):
+        raise InvalidImapArgument(_("Invalid mailbox name"))
+    encoded = name.encode("imap4-utf-7")
+    return b'"' + encoded.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+
+
+def parse_thread_response(data: list | None) -> list[list[str]]:
+    """Turn a THREAD response into a flat list of threads.
+
+    The server answers with nested groups (RFC 5256), for instance
+    ``(2)(3 6 (4 23)(44 7 96))``: every UID of a top level group belongs
+    to the same conversation, whatever its depth. Only that grouping is
+    kept here, in the order given by the server, which is the order of
+    the conversation itself.
+
+    An unexpected reply (unbalanced parenthesis, unknown token) is
+    logged and ignored rather than raising: a broken thread listing must
+    not break the mailbox.
+    """
+    if not data:
+        return []
+    raw = b" ".join(part for part in data if part).decode("ascii", "replace").strip()
+    if raw.upper().startswith("THREAD"):
+        raw = raw[len("THREAD") :]
+    if not THREAD_RESPONSE_RE.match(raw):
+        logger.warning("Unexpected THREAD response: %s", raw[:200])
+        return []
+    threads: list[list[str]] = []
+    current: list[str] | None = None
+    depth = 0
+    for token in THREAD_TOKEN_RE.findall(raw):
+        if token == "(":
+            depth += 1
+            if depth == 1:
+                current = []
+        elif token == ")":
+            depth -= 1
+            if depth < 0:
+                logger.warning("Unbalanced THREAD response: %s", raw[:200])
+                return []
+            if depth == 0 and current:
+                threads.append(current)
+                current = None
+        elif current is not None:
+            current.append(token)
+        else:
+            # A bare UID outside of any group is a thread of its own
+            threads.append([token])
+    if depth:
+        logger.warning("Unbalanced THREAD response: %s", raw[:200])
+        return []
+    return threads
+
+
+# A MIME parameter name, possibly split into sections and possibly
+# carrying its own charset (RFC 2231): name, name*, name*0, name*0*...
+MIME_PARAMETER_RE = re.compile(
+    r"^(?P<name>[^*]+)(?:\*(?P<section>\d+))?(?P<encoded>\*)?$", re.I
+)
+
+
+def decode_mime_parameters(definition) -> dict[str, str]:
+    """Decode the parameters of a MIME part into {name: value}.
+
+    A file name reaches us in one of three shapes:
+
+    * plain ASCII, or encoded as an RFC 2047 word (``=?utf-8?Q?...?=``),
+      which is what the message headers use;
+    * RFC 2231 extended, ``filename*`` holding ``charset\'lang\'text``
+      with the text percent-encoded, used as soon as the name has an
+      accent;
+    * RFC 2231 split over numbered sections, ``filename*0*``,
+      ``filename*1*``..., used when the name is long. Each section says
+      for itself whether it is encoded, and only the first one carries
+      the charset.
+    """
+    if not definition or definition == "NIL":
+        return {}
+    sections: dict[str, dict[int, tuple[str, bool]]] = {}
+    plain: dict[str, str] = {}
+    for pos in range(0, len(definition) - 1, 2):
+        key, value = definition[pos], definition[pos + 1]
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        match = MIME_PARAMETER_RE.match(key)
+        if not match:
+            continue
+        name = match.group("name").lower()
+        if match.group("section") is None and not match.group("encoded"):
+            plain[name] = u2u_decode.u2u_decode(value)
+            continue
+        section = int(match.group("section") or 0)
+        sections.setdefault(name, {})[section] = (value, bool(match.group("encoded")))
+
+    result = dict(plain)
+    for name, parts in sections.items():
+        charset = None
+        decoded = []
+        for _section, (value, encoded) in sorted(parts.items()):
+            if not encoded:
+                decoded.append(value)
+                continue
+            part_charset, _lang, text = email.utils.decode_rfc2231(value)
+            # Only the first section announces the charset
+            charset = part_charset or charset
+            decoded.append(
+                urllib.parse.unquote(
+                    text, encoding=charset or "us-ascii", errors="replace"
+                )
+            )
+        result[name] = "".join(decoded)
+    return {name: value.strip("\r\t\n") for name, value in result.items()}
+
+
+class BodyStructure:
+    """
+    BODYSTRUCTURE response parser.
+
+    Just a simple class that tries to distinguish content parts from
+    attachments.
+    """
+
+    current_mailbox: str
+
+    def __init__(self, definition: list | None = None) -> None:
+        self.is_multipart = False
+        self.contents: dict[str, list] = {}
+        self.attachments: list[dict] = []
+        self.inlines: dict[str, dict] = {}
+
+        if definition is not None:
+            self.load_from_definition(definition)
+
+    def __store_part(
+        self, definition: list, pnum: str, multisubtype: str | None
+    ) -> None:
+        """Store the given message part in the appropriate category.
+
+        This method sort parts in three categories:
+
+        * contents (what is going to be displayed)
+        * inlines (images embedded into the HTML content)
+        * attachments
+
+        As there is no official definition about what is a content and
+        what is an attachment, the following rules are applied:
+
+        * A text/plain or text/html part is a content, unless its
+          disposition says it is an attachment
+
+        * An image that can be displayed and carries a Content-ID is an
+          inline, unless it is outside a multipart/related and its
+          disposition says it is an attachment. Whether the HTML
+          content really references it is only known once the content
+          is loaded: see ImapEmail.
+
+        * Anything else is an attachment
+
+        :param definition: a part definition (list)
+        :param pnum: the part's number
+        :param multisubtype: the subtype of the enclosing multipart
+
+        """
+        pnum = "1" if pnum is None else pnum
+        cid = definition[3]
+        params = {
+            "pnum": pnum,
+            "params": definition[2],
+            "cid": cid if isinstance(cid, str) and cid != "NIL" else None,
+            "description": definition[4],
+            "encoding": definition[5],
+            "size": definition[6],
+        }
+        mtype = definition[0].lower()
+        subtype = definition[1].lower()
+        ftype = f"{mtype}/{subtype}"
+        params["Content-Type"] = ftype
+        if len(definition) > 7:
+            extensions = ["md5", "disposition", "language", "location"]
+            if mtype == "text":
+                extensions = ["textlines"] + extensions
+            elif ftype == "message/rfc822":
+                extensions = ["envelopestruct", "bodystruct", "textlines"] + extensions
+            for idx, value in enumerate(definition[7 : len(extensions) + 7]):
+                params[extensions[idx]] = value
+        disposition = params.get("disposition")
+        disposition = (
+            disposition[0].lower()
+            if isinstance(disposition, list)
+            and disposition
+            and isinstance(disposition[0], str)
+            else None
+        )
+        in_related = (multisubtype or "").lower() == "related"
+
+        if ftype in ("text/plain", "text/html") and disposition != "attachment":
+            self.contents.setdefault(subtype, []).append(params)
+            return
+        if (
+            ftype in constants.INLINE_IMAGE_MIME_TYPES
+            and params["cid"]
+            and (in_related or disposition != "attachment")
+        ):
+            self.inlines[params["cid"].strip("<>")] = params
+            return
+        self.attachments += [params]
+
+    def load_from_definition(
+        self, definition: list, multisubtype: str | None = None
+    ) -> None:
+        for mp in definition:
+            if isinstance(mp, list):
+                if isinstance(mp[0], list):
+                    self.load_from_definition(mp, mp[1])
+                else:
+                    # The parts of the multipart being loaded
+                    self.load_from_definition(mp, multisubtype)
+            elif isinstance(mp, dict):
+                if isinstance(mp["struct"][0], list):
+                    self.load_from_definition(mp["struct"][0], mp["struct"][1])
+                    continue
+                self.__store_part(mp["struct"], mp["partnum"], multisubtype)
+
+    def has_attachments(self) -> int:
+        return len(self.attachments)
+
+    def list_attachments(self) -> list[dict]:
+        """Describe every attachment of the message.
+
+        Name, size and content type all come from the body structure,
+        which the listing already fetches: describing an attachment
+        never costs an extra request.
+        """
+        return [self.describe_part(att) for att in self.attachments]
+
+    @staticmethod
+    def describe_part(part: dict) -> dict:
+        """Describe a part the way the interface lists attachments.
+
+        A part whose name can't be decoded gets a generic one (part_1,
+        part_2, ...).
+        """
+        # Content-Disposition wins over Content-Type: it is the one
+        # that names a file, the other names the body part
+        disposition = part.get("disposition")
+        name = (
+            decode_mime_parameters(
+                disposition[1]
+                if isinstance(disposition, list) and len(disposition) > 1
+                else None
+            ).get("filename")
+            or decode_mime_parameters(part.get("params")).get("name")
+            or f"part_{part['pnum']}"
+        )
+        return {
+            "name": smart_str(name),
+            "partnum": part["pnum"],
+            "size": part.get("size"),
+            "content_type": part.get("Content-Type"),
+        }
+
+    def find_attachment(self, pnum: str) -> dict | None:
+        """Find a part that can be downloaded.
+
+        Inlines are included: the ones the content doesn't reference
+        are listed as attachments.
+        """
+        for att in self.attachments + list(self.inlines.values()):
+            if pnum == att["pnum"]:
+                return att
+        return None
+
+
+# Search criteria understood by parse_search_parameters, mapped to their
+# IMAP key
+SEARCH_KEYS = {
+    "from_addr": "FROM",
+    "to": "TO",
+    "cc": "CC",
+    "subject": "SUBJECT",
+    "body": "BODY",
+}
+
+SEARCH_CRITERION_ALIASES = {
+    # Kept for compatibility
+    "both": "from_addr,subject",
+    # What the single search field of the interface looks for
+    "all": "from_addr,to,cc,subject,body",
+}
+
+
+class IMAPconnector:
+    """The IMAPv4 connector."""
+
+    namespaces_pattern = re.compile(r"(\(\(.+?\)\)|NIL)")
+    namespace_pattern = re.compile(r'\("(?P<prefix>.*?)" "(?P<delimiter>.+?)"\)')
+    list_base_pattern = r'\((?P<flags>.*?)\) "(?P<delimiter>.*)" "?(?P<name>[^"]*)"?'
+    list_response_pattern_literal = re.compile(
+        r'\((?P<flags>.*?)\) "(?P<delimiter>.*)" \{(?P<namelen>\d+)\}'
+    )
+    list_response_pattern = re.compile(list_base_pattern)
+    listextended_response_pattern = re.compile(
+        list_base_pattern + r"\s*(?P<childinfo>.*)"
+    )
+    unseen_pattern = re.compile(r"[^\(]+\(UNSEEN (\d+)\)")
+    # STATUS response sent along a LIST reply: '"Archive" (MESSAGES 3 UNSEEN 1)'
+    status_response_pattern = re.compile(
+        r'^(?:STATUS\s+)?"?(?P<name>[^"(]*?)"?\s*\((?P<items>[^)]*)\)\s*$'
+    )
+    status_unseen_pattern = re.compile(r"UNSEEN (\d+)")
+    status_item_pattern = re.compile(r"([A-Z]+) (\d+)")
+
+    def __init__(self, user: str, password: str, with_namespaces: bool = True) -> None:
+        self.__hdelimiter: str | None = None
+        self.__ns_prefixes: dict = {}
+        self.quota_usage: int = -1
+        self.quota_limit: int | None = None
+        self.quota_current: int | None = None
+        self.criterions: list = []
+        self.conf = dict(param_tools.get_global_parameters("webmail"))
+        self.address = self.conf["imap_server"]
+        self.port = self.conf["imap_port"]
+        self.user = user
+        self.password = password
+        self.with_namespaces = with_namespaces
+        # Unseen counters collected from the last LIST reply
+        self._unseen_counters: dict[str, int] = {}
+        # Number of opened "with" blocks using this connector
+        self._usage_count = 0
+        # True when the connection lifetime is tied to a request
+        self.managed = False
+
+    def __enter__(self):
+        """Open the connection, or join the one already opened.
+
+        Blocks can be nested (a viewset using a connector while building
+        an ImapEmail, for example): only the outermost one authenticates.
+        """
+        self._usage_count += 1
+        # A request-scoped connector stays open between blocks: only
+        # authenticate when there is no connection yet.
+        if self._usage_count == 1 and not self.connected:
+            self.login(self.user, self.password)
+            if self.with_namespaces:
+                self.load_namespaces()
+        return self
+
+    def __exit__(self, *args):
+        self._usage_count = max(self._usage_count - 1, 0)
+        # A request-scoped connector is closed once the request is over
+        if self._usage_count == 0 and not self.managed:
+            self.logout()
+
+    @property
+    def connected(self) -> bool:
+        return getattr(self, "m", None) is not None
+
+    def _cmd(self, name: str, *args, **kwargs) -> list | None:
+        """IMAP command wrapper.
+
+        To simplify errors handling, this wrapper calls the
+        appropriate method (``uid`` or FIXME) and then check the
+        return code. If an error has occured, an ``ImapError``
+        exception is raised.
+
+        For specific commands commands (FETCH, ...), the result is
+        parsed using the IMAPclient module before being returned.
+
+        :param name: the command's name
+        :return: the command's result
+        """
+        if name in ["FETCH", "SORT", "STORE", "COPY", "SEARCH", "MOVE", "THREAD"]:
+            try:
+                typ, data = self.m.uid(name, *args)
+            except (IMAP4Error, OSError) as e:
+                raise ImapError(e) from None
+            if typ == "NO":
+                raise ImapError(data)
+            if name == "FETCH":
+                return FetchResponseParser().parse(data)
+            return data
+
+        try:
+            typ, data = self.m._simple_command(name, *args)
+        except (IMAP4Error, OSError) as e:
+            raise ImapError(e) from None
+        if typ == "NO":
+            raise ImapError(data)
+        if "responses" not in kwargs:
+            if name not in self.m.untagged_responses:
+                return None
+            return self.m.untagged_responses.pop(name)
+        res = []
+        for r in kwargs["responses"]:
+            if r not in self.m.untagged_responses:
+                return None
+            res.append(self.m.untagged_responses.pop(r))
+        return res
+
+    @property
+    def hdelimiter(self):
+        """Return the default hierachy delimiter.
+
+        :return: a string
+        """
+        if self.__hdelimiter is None:
+            raise InternalError(_("Failed to retrieve hierarchy delimiter"))
+        return self.__hdelimiter
+
+    @property
+    def shared_prefix(self) -> str | None:
+        """Prefix of the folders shared by other users (eg. "shared/")."""
+        prefixes = self.__ns_prefixes.get("others")
+        return prefixes[0] if prefixes else None
+
+    @property
+    def sharing_enabled(self) -> bool:
+        """Can users share their folders (RFC 4314)?"""
+        # With '.', the owner addresses would be split into several levels
+        return (
+            "ACL" in getattr(self, "capabilities", [])
+            and self.shared_prefix is not None
+            and self.hdelimiter != "."
+        )
+
+    def get_shared_mailbox_owner(self, name: str) -> str | None:
+        """Return the owner of a shared folder.
+
+        The root of the shared namespace has no owner (""), and personal
+        folders return None.
+        """
+        prefix = self.shared_prefix
+        if prefix is None or not f"{name}{self.hdelimiter}".startswith(prefix):
+            return None
+        return name[len(prefix) :].split(self.hdelimiter)[0]
+
+    def _oauthbearer_error_response(self, challenge: bytes) -> bytes:
+        """Answer an OAUTHBEARER error challenge.
+
+        Must be a bound method: imaplib only calls back methods, any
+        other value is sent as a literal. Returns base64 encoded %x01.
+        """
+        return b"AQ=="
+
+    def login(self, user: str, rawtoken: str) -> None:
+        """Custom login method
+
+        We connect to the server, issue a LOGIN command. If
+        successfull, we try to record a eventuel CAPABILITY untagged
+        response. Otherwise, we issue the command.
+
+        :param user: username
+        :param passwd: password
+        """
+        timeout = getattr(settings, "WEBMAIL_IMAP_TIMEOUT", DEFAULT_IMAP_TIMEOUT)
+        try:
+            if self.conf["imap_secured"]:
+                self.m = imaplib.IMAP4_SSL(self.address, self.port, timeout=timeout)
+            else:
+                self.m = imaplib.IMAP4(self.address, self.port, timeout=timeout)
+        except (OSError, IMAP4Error, ssl.SSLError) as error:
+            raise ImapError(_(f"Connection to IMAP server failed: {error}")) from None
+
+        dev_mode = getattr(settings, "WEBMAIL_DEV_MODE", False)
+        if not dev_mode:
+            token = oauth2.build_oauthbearer_string(user, rawtoken)
+            # On failure, the server sends an error challenge and waits
+            # for the client response before the tagged NO (RFC 7628)
+            self.m.literal = self._oauthbearer_error_response
+            data = self._cmd("AUTHENTICATE", b"OAUTHBEARER", token)
+        else:
+            user = bytes(settings.WEBMAIL_DEV_USERNAME, "utf-8")
+            passwd = self.m._quote(settings.WEBMAIL_DEV_PASSWORD)
+            # Starting with Python 3.13, _quote() returns bytes
+            if not isinstance(passwd, bytes):
+                passwd = bytes(passwd, "utf-8")
+            data = self._cmd("LOGIN", user, passwd)
+        self.m.state = "AUTH"
+        if "CAPABILITY" in self.m.untagged_responses:
+            # Sent along the authentication reply: free and fresh
+            self.capabilities = (
+                self.m.untagged_responses.pop("CAPABILITY")[0].decode().split()
+            )
+            return
+        key = self._server_info_key("capabilities")
+        self.capabilities = cache.get(key)
+        if self.capabilities is None:
+            data = self._cmd("CAPABILITY")
+            self.capabilities = data[0].decode().split()
+            cache.set(key, self.capabilities, SERVER_INFO_CACHE_TIMEOUT)
+
+    def logout(self) -> None:
+        """Logout from server.
+
+        The connection may already be gone (server timeout or restart):
+        the commands below then fail for no useful reason, since the
+        connection is dropped anyway. The socket is always closed, even
+        when the server never answered our LOGOUT.
+        """
+        if not self.connected:
+            return
+        self._usage_count = 0
+        try:
+            # No CHECK first: it costs a round trip on every request and
+            # servers commit changes on their own (RFC 9051 removed it).
+            self._cmd("LOGOUT")
+        except (ImapError, OSError):
+            pass
+        finally:
+            try:
+                self.m.shutdown()
+            except (IMAP4Error, OSError):
+                pass
+            self.m = None
+            if hasattr(self, "current_mailbox"):
+                del self.current_mailbox
+
+    def _server_info_key(self, name: str) -> str:
+        return server_info_key(self.address, self.port, self.user, name)
+
+    def load_namespaces(self) -> None:
+        """Load available namespaces.
+
+        They are cached: a NAMESPACE command on every request would cost
+        a round trip for an answer that doesn't change.
+        """
+        key = self._server_info_key("namespaces")
+        cached = cache.get(key)
+        if cached is not None:
+            self.__hdelimiter, self.__ns_prefixes = cached
+            return
+        data = self._cmd("NAMESPACE")
+        nslist = self.namespaces_pattern.findall(data[0].decode())
+        for pos, item in enumerate(["personal", "others", "public"]):
+            if nslist[pos] == "NIL":
+                continue
+            ns = nslist[pos][1:-1]
+            for m in self.namespace_pattern.finditer(ns):
+                if self.__hdelimiter is None:
+                    self.__hdelimiter = m.group("delimiter")
+                if item not in self.__ns_prefixes:
+                    self.__ns_prefixes[item] = []
+                self.__ns_prefixes[item].append(m.group("prefix"))
+        if self.__hdelimiter is not None:
+            cache.set(
+                key,
+                (self.__hdelimiter, self.__ns_prefixes),
+                SERVER_INFO_CACHE_TIMEOUT,
+            )
+
+    def parse_search_parameters(self, criterion: str, pattern: str) -> None:
+        """Parse search information and apply them."""
+
+        def or_criterion(old, c):
+            if old == "":
+                return c
+            return f"OR {old} {c}"
+
+        criterion = SEARCH_CRITERION_ALIASES.get(criterion, criterion)
+
+        if not pattern:
+            criterions = "ALL"
+        else:
+            pattern = escape_search_pattern(pattern)
+            criterions = ""
+            for c in criterion.split(","):
+                key = SEARCH_KEYS.get(c.strip())
+                if key is None:
+                    continue
+                criterions = or_criterion(criterions, f'({key} "{pattern}")')
+            if criterions == "":
+                # None of the given criteria is known: search everywhere
+                # rather than sending an empty, invalid command.
+                criterions = f'(TEXT "{pattern}")'
+
+        self.criterions = [bytearray(criterions, "utf8")]
+
+    @property
+    def has_sort(self) -> bool:
+        """Does the server support the SORT extension (RFC 5256)?"""
+        return "SORT" in getattr(self, "capabilities", [])
+
+    @property
+    def thread_algorithm(self) -> str | None:
+        """The threading algorithm to ask the server for.
+
+        REFS is preferred over REFERENCES. Both follow the reply chain
+        (References, In-Reply-To), but REFERENCES adds the last step of
+        RFC 5256: root messages sharing the same base subject are merged
+        into a single thread. Two unrelated messages called "Invoice"
+        then end up in the same conversation, which is not what mail
+        clients (Thunderbird among them) display. REFS is the same
+        algorithm without that step.
+        """
+        capabilities = getattr(self, "capabilities", [])
+        for algorithm in ("REFS", "REFERENCES"):
+            if f"THREAD={algorithm}" in capabilities:
+                return algorithm
+        return None
+
+    @property
+    def has_thread(self) -> bool:
+        """Does the server support the THREAD extension (RFC 5256)?"""
+        return self.thread_algorithm is not None
+
+    def messages_count(self, **kwargs) -> int:
+        """An enhanced version of messages_count.
+
+        With IMAP, to know how many messages a mailbox contains, we
+        have to make a request to the server. To avoid requests
+        multiplications, we sort messages in the same time. This will
+        be usefull for other methods.
+
+        :param order: sorting order
+        :param folder: mailbox to scan
+        """
+        if "order" in kwargs and kwargs["order"]:
+            sign = kwargs["order"][:1]
+            criterion = kwargs["order"][1:].upper()
+            if sign == "-":
+                criterion = f"REVERSE {criterion}"
+        else:
+            criterion = "REVERSE DATE"
+        mbox = kwargs.get("mbox")
+
+        # FIXME: pourquoi suis je obligé de faire un SELECT ici?  un
+        # EXAMINE plante mais je pense que c'est du à une mauvaise
+        # lecture des réponses de ma part...
+        self.select_mailbox(mbox, readonly=False)
+        if self.has_sort:
+            data = self._cmd(
+                "SORT",
+                f"({criterion})",
+                b"UTF-8",
+                b"(NOT DELETED)",
+                *self.criterions,
+            )
+            self.messages = data[0].decode().split()
+        else:
+            self.messages = self._search_messages(
+                reverse=criterion.startswith("REVERSE")
+            )
+        return len(self.messages)
+
+    def _search_messages(self, reverse: bool = True) -> list:
+        """List the messages of the selected mailbox without SORT.
+
+        SORT is an extension: servers that lack it only answer SEARCH,
+        which returns UIDs in ascending order. Messages are then ordered
+        by arrival instead of by their Date header, which is the closest
+        approximation we can give without fetching every date.
+        """
+        data = self._cmd(
+            "SEARCH",
+            b"CHARSET",
+            b"UTF-8",
+            b"(NOT DELETED)",
+            *self.criterions,
+        )
+        messages = data[0].decode().split()
+        messages.sort(key=int, reverse=reverse)
+        return messages
+
+    def threads_count(self, **kwargs) -> int:
+        """Group the messages of a mailbox into conversations.
+
+        ``messages_count`` is called first: it selects the mailbox and
+        gives the order of the messages, with SORT when the server
+        offers it and by arrival otherwise. That order then ranks the
+        threads, so that a conversation which receives a new message
+        comes back to the top of the listing.
+
+        The result is stored in ``self.threads``, as a list of UID
+        lists. Inside a thread, UIDs keep the order given by the server,
+        which is the order of the conversation.
+        """
+        self.messages_count(**kwargs)
+        rank = {uid: pos for pos, uid in enumerate(self.messages)}
+        if not self.has_thread:
+            # Without the extension, every message is its own thread
+            self.threads = [[uid] for uid in self.messages]
+            return len(self.threads)
+        data = self._cmd(
+            "THREAD",
+            self.thread_algorithm.encode(),
+            b"UTF-8",
+            b"(NOT DELETED)",
+            *self.criterions,
+        )
+        threads = []
+        for thread in parse_thread_response(data):
+            # A message deleted between the two commands is dropped
+            uids = [uid for uid in thread if uid in rank]
+            if uids:
+                threads.append(uids)
+        threads.sort(key=lambda uids: min(rank[uid] for uid in uids))
+        self.threads = threads
+        return len(self.threads)
+
+    def select_mailbox(
+        self, name: str, readonly: bool = True, force: bool = False
+    ) -> None:
+        """Issue a SELECT/EXAMINE command to the server.
+
+        The given name is first 'imap-utf7' encoded.
+
+        :param name: mailbox's name
+        :param readonly:
+        """
+        if hasattr(self, "current_mailbox"):
+            if self.current_mailbox == name and not force:
+                return
+        self.current_mailbox = name
+        name = self._encode_mbox_name(name)
+        if readonly:
+            self._cmd("EXAMINE", name)
+            self.m.is_readonly = True
+        else:
+            self._cmd("SELECT", name)
+        self.m.state = "SELECTED"
+
+    def unseen_messages(self, mailbox: str) -> int:
+        """Return the number of unseen messages
+
+        :param mailbox: the mailbox's name
+        :return: an integer
+        """
+        data = self._cmd("STATUS", self._encode_mbox_name(mailbox), "(UNSEEN)")
+        m = self.unseen_pattern.match(data[-1].decode())
+        if m is None:
+            return 0
+        return int(m.group(1))
+
+    def mailbox_state(self, mailbox: str) -> dict:
+        """Return a summary of the mailbox content, with one STATUS command.
+
+        ``state`` changes as soon as a message arrives, leaves or (when
+        the server supports CONDSTORE) sees its flags change: clients
+        compare it to know whether their listing is outdated, instead of
+        requesting the listing again.
+
+        :param mailbox: the mailbox's name
+        :return: a dict {"state": str, "unseen": int}
+        """
+        items = ["MESSAGES", "UIDNEXT", "UIDVALIDITY", "UNSEEN"]
+        if "CONDSTORE" in getattr(self, "capabilities", []):
+            items.append("HIGHESTMODSEQ")
+        data = self._cmd(
+            "STATUS", self._encode_mbox_name(mailbox), f"({' '.join(items)})"
+        )
+        response = data[-1].decode() if data else ""
+        # The items are in the last parenthesis: the mailbox name, quoted
+        # before them, may hold anything.
+        values = dict(self.status_item_pattern.findall(response[response.rfind("(") :]))
+        return {
+            "state": "-".join(values.get(item, "") for item in items),
+            "unseen": int(values.get("UNSEEN", 0)),
+        }
+
+    def _encode_mbox_name(self, folder):
+        """Encode folder name (str) to imap4-utf-7 and quote it."""
+        if not folder:
+            return "INBOX"
+        return quote_mailbox_name(folder)
+
+    def _parse_mailbox_name(self, descr, prefix, delimiter, parts):
+        if not len(parts):
+            return False
+        path = f"{prefix}{delimiter}{parts[0]}"
+        sdescr = None
+        for d in descr:
+            if d["path"] == path:
+                sdescr = d
+                break
+        if sdescr is None:
+            sdescr = {"name": parts[0], "path": path, "sub": []}
+            descr += [sdescr]
+        if self._parse_mailbox_name(sdescr["sub"], path, delimiter, parts[1:]):
+            sdescr["class"] = "subfolders"
+        return True
+
+    def _parse_list_response(self, mb) -> tuple[list, str] | None:
+        """Parse a single ``LIST`` response line.
+
+        Handles both the literal form (name returned as a separate
+        ``{length}`` string, yielding a ``(header, name)`` tuple) and the
+        inline form. Returns the mailbox flags (as a list) and its decoded
+        name, or ``None`` for empty lines.
+        """
+        if not mb:
+            return None
+        if type(mb) in [list, tuple]:
+            flags, delimiter, namelen = self.list_response_pattern_literal.match(
+                mb[0].decode()
+            ).groups()
+            name = mb[1][0 : int(namelen)]
+        else:
+            flags, delimiter, name, childinfo = (
+                self.listextended_response_pattern.match(mb.decode()).groups()
+            )
+        flags = flags.split(" ")
+        name = bytearray(name, "utf-8").decode("imap4-utf-7")
+        return flags, name
+
+    @property
+    def has_list_status(self) -> bool:
+        """Does the server return counters along a LIST reply (RFC 5819)?"""
+        return "LIST-STATUS" in getattr(self, "capabilities", [])
+
+    def _collect_unseen_counters(self) -> None:
+        """Read the STATUS responses sent along with a LIST reply.
+
+        With the LIST-STATUS extension, one LIST command brings the
+        counters of every mailbox back, instead of one STATUS command per
+        mailbox.
+        """
+        for item in self.m.untagged_responses.pop("STATUS", []):
+            if isinstance(item, (list, tuple)):
+                item = b" ".join(part for part in item if isinstance(part, bytes))
+            if isinstance(item, bytes):
+                item = item.decode()
+            match = self.status_response_pattern.match(item.strip())
+            if match is None:
+                continue
+            unseen = self.status_unseen_pattern.search(match.group("items"))
+            if unseen is None:
+                continue
+            name = bytearray(match.group("name"), "utf-8").decode("imap4-utf-7")
+            self._unseen_counters[name] = int(unseen.group(1))
+
+    def _listmboxes(
+        self,
+        topmailbox: str,
+        mailboxes: list,
+        until_mailbox=None,
+        subscribed_only: bool = False,
+    ) -> None:
+        """Retrieve mailboxes list."""
+        pattern = (
+            quote_mailbox_name(f"{topmailbox}{self.hdelimiter}%") if topmailbox else "%"
+        )
+        returns = ["SUBSCRIBED", "CHILDREN"]
+        if self.has_list_status:
+            returns.append("STATUS (MESSAGES UNSEEN)")
+        resp = self._cmd("LIST", '""', pattern, "RETURN", f"({' '.join(returns)})")
+        if self.has_list_status:
+            self._collect_unseen_counters()
+        newmboxes = []
+        # No untagged response at all when nothing matches
+        for mb in resp or []:
+            parsed = self._parse_list_response(mb)
+            if parsed is None:
+                continue
+            flags, name = parsed
+            has_children = "\\HasChildren" in flags
+            owner = self.get_shared_mailbox_owner(name)
+            # When only subscribed mailboxes are requested, skip folders the
+            # user is not subscribed to. Unsubscribed folders that still have
+            # children are kept so subscribed descendants remain reachable.
+            # Shared folders are always listed: nobody subscribes to them.
+            if (
+                subscribed_only
+                and owner is None
+                and "\\Subscribed" not in flags
+                and not has_children
+            ):
+                continue
+            mdm_found = False
+            for idx, mdm in enumerate(mailboxes):
+                if mdm["name"] == name:
+                    mdm_found = True
+                    descr = mailboxes[idx]
+                    break
+            if not mdm_found:
+                descr = {"name": name, "label": name, "type": "normal"}
+                if owner is not None:
+                    descr["type"] = "shared"
+                    if owner:
+                        descr["owner"] = owner
+                    else:
+                        descr["label"] = _("Shared with me")
+                newmboxes += [descr]
+
+            # A mailbox can hold unseen messages without being flagged
+            # \Marked (which only tracks messages *recently* added since the
+            # last SELECT). To display accurate counters we compute the unseen
+            # count for every selectable mailbox instead of relying on that
+            # heuristic. \Noselect mailboxes cannot be queried with STATUS.
+            descr["selectable"] = (
+                "\\Noselect" not in flags and r"\NonExistent" not in flags
+            )
+            # The levels of the shared namespace (root, owners) don't exist
+            if r"\NonExistent" in flags and owner is None:
+                descr["removed"] = True
+            if has_children:
+                descr["path"] = name
+                descr["sub"] = []
+                if until_mailbox and until_mailbox.startswith(name):
+                    self._listmboxes(name, descr["sub"], until_mailbox, subscribed_only)
+
+        from operator import itemgetter
+
+        mailboxes += sorted(newmboxes, key=itemgetter("name"))
+
+    def getmboxes(
+        self,
+        user,
+        topmailbox: str = "",
+        until_mailbox=None,
+        unseen_messages: bool = True,
+        subscribed_only: bool = False,
+    ) -> list:
+        """Returns a list of mailboxes for a particular user.
+
+        By default, only the first level of mailboxes under
+        ``topmailbox`` is returned. If ``until_mailbox`` is specified,
+        all levels needed to access this mailbox will be returned.
+
+        :param user: a ``User`` instance
+        :param topmailbox: the mailbox where to start in the tree
+        :param until_mailbox: the deepest needed mailbox
+        :param unseen_messages: include unseen messages counters or not
+        :param subscribed_only: only return mailboxes the user is subscribed to
+        :return: a list
+        """
+        if topmailbox:
+            md_mailboxes = []
+        else:
+            md_mailboxes = [
+                {"name": "INBOX", "type": "inbox", "label": _("Inbox")},
+                {
+                    "name": user.parameters.get_value("drafts_folder"),
+                    "type": "draft",
+                    "label": _("Drafts"),
+                },
+                {
+                    "name": user.parameters.get_value("junk_folder"),
+                    "type": "junk",
+                    "label": _("Junk"),
+                },
+                {
+                    "name": user.parameters.get_value("sent_folder"),
+                    "type": "sent",
+                    "label": _("Sent"),
+                },
+            ]
+            if user.scheduledmessage_set.exists():
+                md_mailboxes += [
+                    {
+                        "name": constants.MAILBOX_NAME_SCHEDULED,
+                        "type": "scheduled",
+                        "label": _("Scheduled"),
+                    },
+                ]
+            md_mailboxes += [
+                {
+                    "name": user.parameters.get_value("trash_folder"),
+                    "type": "trash",
+                    "label": _("Trash"),
+                },
+            ]
+        self._unseen_counters = {}
+        if until_mailbox:
+            name, parent = separate_mailbox(until_mailbox, self.hdelimiter)
+            if parent:
+                until_mailbox = parent
+        self._listmboxes(topmailbox, md_mailboxes, until_mailbox, subscribed_only)
+        self._set_unseen_counters(md_mailboxes, unseen_messages)
+        self._set_shared_owner_labels(md_mailboxes)
+        return md_mailboxes
+
+    def _set_shared_owner_labels(self, mailboxes: list) -> None:
+        """Show the name of the users sharing folders, not their address."""
+
+        def owner_nodes(items):
+            for item in items:
+                owner = item.get("owner")
+                if owner and item["name"] == f"{self.shared_prefix}{owner}":
+                    yield item
+                yield from owner_nodes(item.get("sub") or [])
+
+        nodes = list(owner_nodes(mailboxes))
+        if not nodes:
+            return
+        names = {
+            user.username: user.fullname
+            for user in User.objects.filter(
+                username__in={node["owner"] for node in nodes}
+            )
+        }
+        for node in nodes:
+            node["label"] = names.get(node["owner"], node["owner"])
+
+    def _set_unseen_counters(self, mailboxes: list, compute: bool = True) -> None:
+        """Compute the unseen messages counter of each selectable mailbox."""
+        for mb in mailboxes:
+            selectable = mb.get("selectable", False)
+            if mb.get("sub"):
+                self._set_unseen_counters(mb["sub"], compute)
+            if not compute or not selectable or mb.get("removed", False):
+                continue
+            key = "path" if "path" in mb else "name"
+            count = self._unseen_counters.get(mb[key])
+            if count is None:
+                # Server without LIST-STATUS: ask for this mailbox only
+                count = self.unseen_messages(mb[key])
+            if count:
+                mb["unseen"] = count
+
+    def _add_flag(self, mbox: str, msgset: list[str], flag: str) -> None:
+        """Add flag to a messages set.
+
+        :param mbox: the mailbox containing the messages
+        :param msgset: messages set (uid)
+        :param flag: the flag to add
+        """
+        self.select_mailbox(mbox, False)
+        self._cmd("STORE", ",".join(msgset), "+FLAGS", flag)
+
+    def _remove_flag(self, mbox: str, msgset: list[str], flag: str) -> None:
+        """Remove flag from a message set.
+
+        :param mbox: the mailbox containing the messages
+        :param msgset: messages set (uid)
+        :param flag: the flag to remove
+        """
+        self.select_mailbox(mbox, False)
+        self._cmd("STORE", ",".join(msgset), "-FLAGS", flag)
+
+    def mark_messages_unread(self, mbox: str, msgset: list[str]) -> None:
+        """Mark a set of messages as unread.
+
+        :param mbox: the mailbox containing the messages
+        :param msgset: messages set (uid)
+        """
+        self._remove_flag(mbox, msgset, r"(\Seen)")
+
+    def mark_messages_read(self, mbox: str, msgset: list[str]) -> None:
+        """Mark a set of messages as unread.
+
+        :param mbox: the mailbox containing the messages
+        :param msgset: messages set (uid)
+        """
+        self._add_flag(mbox, msgset, r"(\Seen)")
+
+    def mark_messages_flagged(self, mbox: str, msgset: list[str]) -> None:
+        """Mark a set of messages as flagged.
+
+        :param mbox: the mailbox containing the messages
+        :param msgset: messages set (uid)
+        """
+        self._add_flag(mbox, msgset, r"(\Flagged)")
+
+    def mark_messages_unflagged(self, mbox: str, msgset: list[str]) -> None:
+        """Mark a set of messages as unflagged.
+
+        :param mbox: the mailbox containing the messages
+        :param msgset: messages set (uid)
+        """
+        self._remove_flag(mbox, msgset, r"(\Flagged)")
+
+    def msg_forwarded(self, mailbox: str, mailid: str) -> None:
+        """Add the $Forwarded flag to this email."""
+        # _add_flag expects a list: joining a plain string would flag
+        # the messages 1, 2, 3 for UID "123".
+        self._add_flag(mailbox, [validate_imap_uid(mailid)], "($Forwarded)")
+
+    def msg_answered(self, mailbox: str, mailid: str) -> None:
+        """Add the \\Answered flag to this email."""
+        self._add_flag(mailbox, [validate_imap_uid(mailid)], r"(\Answered)")
+
+    @property
+    def has_move(self) -> bool:
+        """Does the server support the MOVE extension (RFC 6851)?"""
+        return "MOVE" in getattr(self, "capabilities", [])
+
+    @property
+    def has_uidplus(self) -> bool:
+        """Does the server support the UIDPLUS extension (RFC 4315)?"""
+        return "UIDPLUS" in getattr(self, "capabilities", [])
+
+    def _uid_expunge(self, msgset) -> None:
+        """Expunge the given messages, and only them (RFC 4315).
+
+        A plain EXPUNGE would also remove every other message flagged as
+        deleted in the mailbox, including those another client of the
+        user flagged without wanting to erase them yet.
+        """
+        try:
+            typ, data = self.m.uid("EXPUNGE", msgset)
+        except IMAP4Error as e:
+            raise ImapError(e) from None
+        if typ == "NO":
+            raise ImapError(data)
+
+    def move(self, msgset, oldmailbox: str, newmailbox: str) -> None:
+        """Move messages between mailboxes.
+
+        MOVE does it with a single atomic command. Without it, messages
+        are copied, flagged as deleted, then expunged by UID: leaving
+        them behind would keep them visible in other mail clients and
+        counted in the user quota.
+        """
+        self.select_mailbox(oldmailbox, False)
+        if self.has_move:
+            self._cmd("MOVE", msgset, self._encode_mbox_name(newmailbox))
+            return
+        self._cmd("COPY", msgset, self._encode_mbox_name(newmailbox))
+        self._cmd("STORE", msgset, "+FLAGS", r"(\Deleted \Seen)")
+        if self.has_uidplus:
+            self._uid_expunge(msgset)
+
+    def push_mail(self, mbox: str, msg) -> int:
+        """
+        Append a new message to a mailbox.
+
+        Return the UID of the created message.
+        """
+        now = imaplib.Time2Internaldate(time.time())
+        msg = bytes(msg)
+        typ, data = self.m.append(self._encode_mbox_name(mbox), r"(\Seen)", now, msg)
+        response = data[0].decode()
+        m = re.match(r"\[APPENDUID \d+ (\d+)\].+", response)
+        if m:
+            return int(m.group(1))
+        raise WebmailInternalError("Failed to retrieve message UID")
+
+    def delete_mail(self, mbox: str, uid: int) -> None:
+        """
+        Delete given message (set \Deleted flag) and expunge mailbox.
+
+        Do not use directly.
+        """
+        uid = validate_imap_uid(uid)
+        self.select_mailbox(mbox, False)
+        self._cmd("STORE", uid.encode(), "+FLAGS", r"(\Deleted)")
+        if self.has_uidplus:
+            self._uid_expunge(uid)
+        else:
+            self._cmd("EXPUNGE")
+
+    def empty(self, mbox: str):
+        self.select_mailbox(mbox, False)
+        resp = self._cmd("SEARCH", "ALL")
+        seq = b",".join(resp[0].split())
+        if seq == b"":
+            return
+        self._cmd("STORE", seq, "+FLAGS", r"(\Deleted)")
+        self._cmd("EXPUNGE")
+
+    def compact(self, mbox: str):
+        """Compact a specific mailbox.
+
+        Issue an EXPUNGE command for the specified mailbox.
+
+        :param mbox: the mailbox's name
+        """
+        self.select_mailbox(mbox, False)
+        self._cmd("EXPUNGE")
+
+    def _mailbox_command(self, command: str, *args) -> list:
+        """Run a mailbox management command (create, rename, delete...).
+
+        The server refusing the operation (NO response) is reported with
+        its message; imaplib raises an exception on BAD responses.
+        """
+        try:
+            typ, data = getattr(self.m, command)(*args)
+        except IMAP4Error as error:
+            raise MailboxOperationError(str(error)) from None
+        if typ == "NO":
+            raise MailboxOperationError(data[0])
+        return data
+
+    def create_folder(self, name: str, parent: str | None = None) -> bool:
+        if parent is not None:
+            name = f"{parent}{self.hdelimiter}{name}"
+        self._mailbox_command("create", self._encode_mbox_name(name))
+        return True
+
+    def rename_folder(self, oldname: str, newname: str) -> bool:
+        self._mailbox_command(
+            "rename", self._encode_mbox_name(oldname), self._encode_mbox_name(newname)
+        )
+        return True
+
+    def delete_folder(self, name: str) -> bool:
+        self._mailbox_command("delete", self._encode_mbox_name(name))
+        return True
+
+    def get_subfolders(self, name: str) -> list[str]:
+        """Return the names of all the folders below the given one."""
+        pattern = quote_mailbox_name(f"{name}{self.hdelimiter}*")
+        names = []
+        for mb in self._cmd("LIST", '""', pattern) or []:
+            parsed = self._parse_list_response(mb)
+            if parsed is not None:
+                names.append(parsed[1])
+        return names
+
+    def get_acl(self, name: str) -> dict[str, str]:
+        """Return the rights (RFC 4314 letters) of each identifier."""
+        tokens = parse_acl_response(
+            self._mailbox_command("getacl", self._encode_mbox_name(name))
+        )
+        # The mailbox name comes first, then identifier/rights pairs
+        return dict(zip(tokens[1::2], tokens[2::2], strict=True))
+
+    def get_my_rights(self, name: str) -> str:
+        """Return the rights of the current user on a mailbox."""
+        tokens = parse_acl_response(
+            self._mailbox_command("myrights", self._encode_mbox_name(name))
+        )
+        return tokens[-1]
+
+    def set_acl(self, name: str, identifier: str, rights: str) -> None:
+        self._mailbox_command(
+            "setacl", self._encode_mbox_name(name), quote_string(identifier), rights
+        )
+
+    def delete_acl(self, name: str, identifier: str) -> None:
+        self._mailbox_command(
+            "deleteacl", self._encode_mbox_name(name), quote_string(identifier)
+        )
+
+    def get_subscriptions(self) -> list[dict]:
+        """Return every mailbox with its subscription status.
+
+        Contrary to :meth:`getmboxes`, every folder is returned
+        (regardless of subscription), as a flat list sorted
+        hierarchically: a folder comes right before its children. Each
+        item is a dict with the following keys: ``name`` (full path) and
+        ``subscribed`` (bool).
+        """
+        resp = self._cmd("LIST", '""', '"*"', "RETURN", "(SUBSCRIBED)")
+        entries = []
+        for mb in resp or []:
+            parsed = self._parse_list_response(mb)
+            if parsed is None:
+                continue
+            flags, name = parsed
+            entries.append({"name": name, "subscribed": "\\Subscribed" in flags})
+        # Sorting on the path components keeps children right after their
+        # parent ("A/B" would come after "A-B" with a plain string sort).
+        entries.sort(key=lambda e: e["name"].split(self.hdelimiter))
+        return entries
+
+    def subscribe_folder(self, name: str) -> bool:
+        self._mailbox_command("subscribe", self._encode_mbox_name(name))
+        return True
+
+    def unsubscribe_folder(self, name: str) -> bool:
+        self._mailbox_command("unsubscribe", self._encode_mbox_name(name))
+        return True
+
+    def getquota(self, mailbox: str) -> None:
+        """Retrieve quota information from the server.
+
+        We also compute the current usage.
+        """
+        self.quota_limit = self.quota_current = None
+        self.quota_usage = -1
+        if "QUOTA" not in self.capabilities:
+            return
+        try:
+            data = self._cmd(
+                "GETQUOTAROOT",
+                self._encode_mbox_name(mailbox),
+                responses=["QUOTAROOT", "QUOTA"],
+            )
+        except ImapError:
+            data = None
+
+        if data is None:
+            return
+
+        quotadef = data[1][0].decode()
+        # A quota root may define other resources (MESSAGE...) along STORAGE
+        m = re.search(r"\bSTORAGE (\d+) (\d+)", quotadef)
+        if not m:
+            logger.warning("Failed to parse quota definition: %s", quotadef)
+            return
+        self.quota_limit = int(m.group(2))
+        self.quota_current = int(m.group(1))
+        if self.quota_limit:
+            self.quota_usage = int(self.quota_current / self.quota_limit * 100)
+
+    def fetchpart(self, uid: str, mbox: str, partnum):
+        """Retrieve a specific message part.
+
+        Useful to fetch attachments from the server. Part headers and
+        the payload are returned separatly.
+
+        :param uid: a message UID
+        :param mbox: the mailbox containing the message
+        :param partnum: the part number
+        :return: a 2uple (dict, string)
+        """
+        uid = validate_imap_uid(uid)
+        partnum = validate_imap_partnum(partnum)
+        self.select_mailbox(mbox, False)
+        data = self._cmd("FETCH", uid, f"(BODYSTRUCTURE BODY[{partnum}])")
+        bs = BodyStructure(data[int(uid)]["BODYSTRUCTURE"])
+        attdef = bs.find_attachment(partnum)
+        return attdef, data[int(uid)][f"BODY[{partnum}]"]
+
+    def fetch_parts(self, uid: str, mbox: str, pnums: list[str]) -> dict:
+        """Retrieve several parts of a message with a single FETCH.
+
+        Parts are peeked: reading them doesn't mark the message as seen.
+        Parts the server does not return are missing from the result.
+
+        :param uid: a message UID
+        :param mbox: the mailbox containing the message
+        :param pnums: the part numbers
+        :return: a dict {part number: raw payload}
+        """
+        if not pnums:
+            return {}
+        uid = validate_imap_uid(uid)
+        pnums = [validate_imap_partnum(pnum) for pnum in pnums]
+        self.select_mailbox(mbox, False)
+        items = " ".join(f"BODY.PEEK[{pnum}]" for pnum in pnums)
+        data = self._cmd("FETCH", uid, f"({items})")
+        if not data or int(uid) not in data:
+            return {}
+        msg = data[int(uid)]
+        return {pnum: msg[f"BODY[{pnum}]"] for pnum in pnums if f"BODY[{pnum}]" in msg}
+
+    def fetch(
+        self, start: int, stop: int | None = None, mbox: str | None = None
+    ) -> list:
+        """Retrieve information about messages from the server.
+
+        Issue a FETCH command to retrieve information about one or
+        more messages (such as headers) from the server.
+
+        :param start: index of the first message
+        :param stop: index of the last message (optionnal)
+        :param mbox: the mailbox that contains the messages
+        """
+        if start and stop:
+            submessages = self.messages[start - 1 : stop]
+        else:
+            submessages = [start]
+        return self.fetch_uids(submessages, mbox)
+
+    def fetch_uids(self, uids: list, mbox: str | None = None) -> list:
+        """Retrieve the headers of the given messages.
+
+        One FETCH command is issued for the whole list. Messages the
+        server does not return (deleted in the meantime) are skipped.
+
+        :param uids: the UIDs to retrieve
+        :param mbox: the mailbox that contains the messages
+        """
+        if not uids:
+            return []
+        self.select_mailbox(mbox, False)
+        mrange = ",".join(str(uid) for uid in uids)
+        headers = "DATE FROM TO CC SUBJECT"
+        if mbox == constants.MAILBOX_NAME_SCHEDULED:
+            headers += " X-SCHEDULED-ID X-SCHEDULED-DATETIME"
+        query = (
+            f"(FLAGS BODYSTRUCTURE RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({headers})])"
+        )
+        data = self._cmd("FETCH", mrange, query)
+        result = []
+        for uid in uids:
+            msg_data = data.get(int(uid))
+            if msg_data is None:
+                logger.debug("Message %s is missing from the FETCH reply", uid)
+                continue
+            msg = email.message_from_string(
+                msg_data[f"BODY[HEADER.FIELDS ({headers})]"]
+            )
+            msg["imapid"] = uid
+            msg["size"] = msg_data["RFC822.SIZE"]
+            if r"\Seen" not in msg_data["FLAGS"]:
+                msg["style"] = "unseen"
+            if r"\Answered" in msg_data["FLAGS"]:
+                msg["answered"] = True
+            if r"$Forwarded" in msg_data["FLAGS"]:
+                msg["forwarded"] = True
+            if r"\Flagged" in msg_data["FLAGS"]:
+                msg["flagged"] = True
+            bstruct = BodyStructure(msg_data["BODYSTRUCTURE"])
+            if bstruct.has_attachments():
+                msg["attachments"] = True
+                # Described here rather than on demand: the body
+                # structure is already parsed, naming its parts is free
+                msg["attachment_list"] = bstruct.list_attachments()
+            result += [msg]
+        return result
+
+    def fetch_threads(
+        self, start: int, stop: int | None = None, mbox: str | None = None
+    ) -> list[dict]:
+        """Build a summary of the threads of the given page.
+
+        All the messages of the page are retrieved with a single FETCH,
+        through the same code path as the flat listing, so that flags
+        and body structures are parsed only once and in one place.
+
+        :param start: index of the first thread
+        :param stop: index of the last thread
+        :param mbox: the mailbox that contains the messages
+        """
+        subthreads = self.threads[start - 1 : stop] if start and stop else []
+        messages = {
+            str(msg["imapid"]): msg
+            for msg in self.fetch_uids(
+                [uid for thread in subthreads for uid in thread], mbox
+            )
+        }
+        rank = {uid: pos for pos, uid in enumerate(self.messages)}
+        result = []
+        for thread in subthreads:
+            msgs = [messages[uid] for uid in thread if uid in messages]
+            if not msgs:
+                continue
+            # self.messages is ordered from the most recent message to
+            # the oldest one, so the latest message has the lowest rank
+            latest = min(msgs, key=lambda msg: rank.get(str(msg["imapid"]), 0))
+            participants = {}
+            for msg in msgs:
+                if "From" in msg:
+                    address = imapheader.parse_address(msg["From"])
+                    participants.setdefault(address["address"], address)
+            result.append(
+                {
+                    "root": str(msgs[0]["imapid"]),
+                    # Serializers expect a mapping, not an email.Message
+                    "latest": dict(latest),
+                    "subject": msgs[0]["Subject"] if "Subject" in msgs[0] else "",
+                    "count": len(msgs),
+                    "unseen_count": sum(
+                        1 for msg in msgs if msg.get("style") == "unseen"
+                    ),
+                    "flagged": any(msg.get("flagged") for msg in msgs),
+                    "attachments": any(msg.get("attachments") for msg in msgs),
+                    "participants": list(participants.values()),
+                    "uids": [str(msg["imapid"]) for msg in msgs],
+                }
+            )
+        return result
+
+    def fetchmail(
+        self, mbox: str, mailid: str, readonly: bool = True, what: str = "bodystructure"
+    ):
+        """Retrieve information about a specific message.
+
+        Issue a FETCH command to retrieve a message's content from the
+        server. In order to not overload the server, we first retrieve
+        the BODYSTRUCTURE of the message. Then, according to the
+        result and to the user's preferences, we retrieve the
+        appropriate content (plain, html, etc.).
+
+        :param mbox: the mailbox containing the message
+        :param mailid: the message's unique id
+        :param readonly:
+        :param headers:
+        """
+        mailid = validate_imap_uid(mailid)
+        self.select_mailbox(mbox, readonly)
+        if what == "bodystructure":
+            to_fetch = "(BODYSTRUCTURE)"
+        elif what == "source":
+            to_fetch = "(BODY[])"
+        else:
+            bcmd = "BODY.PEEK" if readonly else "BODY"
+            to_fetch = f"(BODYSTRUCTURE {bcmd}[HEADER.FIELDS ({what})])"
+        data = self._cmd("FETCH", mailid, to_fetch)
+        if int(mailid) not in data:
+            raise ImapError(f"Message with UID {mailid} not found in {mbox} folder")
+        return data[int(mailid)]
+
+
+def separate_mailbox(fullname: str, sep: str = ".") -> tuple[str, str | None]:
+    """Split a mailbox name.
+
+    If a separator is found in ``fullname``, this function returns the
+    corresponding name and parent mailbox name.
+    """
+    if sep in fullname:
+        parts = fullname.split(sep)
+        name = parts[-1]
+        parent = sep.join(parts[0 : len(parts) - 1])
+        return name, parent
+    return fullname, None
+
+
+CONNECTOR_ATTRIBUTE = "_webmail_imapconnector"
+
+
+def _connection_store(request):
+    """Return the object holding the connector of a request.
+
+    DRF wraps the Django request: always use the underlying one so that
+    every caller shares the same connector.
+    """
+    return getattr(request, "_request", request)
+
+
+def get_imapconnector(request, **kwargs) -> IMAPconnector:
+    """Return the IMAP connector of the given request.
+
+    A single connection is opened per request (and closed by
+    :func:`close_imapconnector`) instead of one per operation: each one
+    costs a TCP connection, a TLS handshake and an authentication.
+
+    :param request: a ``Request`` object
+    """
+    if kwargs:
+        # Specific settings: not shareable
+        return IMAPconnector(
+            request.user.username, oauth2.get_access_token(request), **kwargs
+        )
+    store = _connection_store(request)
+    connector = getattr(store, CONNECTOR_ATTRIBUTE, None)
+    if connector is None:
+        connector = IMAPconnector(
+            request.user.username, oauth2.get_access_token(request)
+        )
+        connector.managed = True
+        setattr(store, CONNECTOR_ATTRIBUTE, connector)
+    return connector
+
+
+def close_imapconnector(request) -> None:
+    """Close the connector of a request, if one was opened."""
+    store = _connection_store(request)
+    connector = getattr(store, CONNECTOR_ATTRIBUTE, None)
+    if connector is None:
+        return
+    delattr(store, CONNECTOR_ATTRIBUTE)
+    try:
+        connector.logout()
+    except (ImapError, OSError):
+        # The connection is being dropped anyway
+        pass

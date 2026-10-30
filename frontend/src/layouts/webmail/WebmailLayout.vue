@@ -1,0 +1,375 @@
+<template>
+  <ConnectedLayout>
+    <template #navbar>
+      <v-navigation-drawer
+        v-model="drawer"
+        :rail="rail"
+        :width="drawerWidth"
+        permanent
+        color="primary"
+      >
+        <div class="resize-handle" @mousedown="startResize" />
+        <template #prepend>
+          <div class="d-flex align-center">
+            <v-img :src="menuLogoPath" max-width="190" class="logo" />
+            <v-btn
+              :icon="rail ? 'mdi-chevron-right' : 'mdi-chevron-left'"
+              variant="text"
+              @click.stop="rail = !rail"
+            >
+            </v-btn>
+          </div>
+
+          <div class="d-flex justify-center mb-4">
+            <v-btn
+              v-if="!rail"
+              :text="$gettext('Compose')"
+              color="secondary"
+              variant="flat"
+              prepend-icon="mdi-pencil"
+              @click="openComposeForm"
+            />
+            <v-btn
+              v-else
+              icon="mdi-pencil"
+              color="secondary"
+              variant="flat"
+              size="small"
+              @click="openComposeForm"
+            />
+          </div>
+        </template>
+        <MailboxList
+          v-model="selectedMailbox"
+          :mailboxes="userMailboxes"
+          :hdelimiter="hdelimiter"
+          class="mr-2"
+          :rail="rail"
+          @update:model-value="openMailbox"
+        />
+        <template #append>
+          <div class="border-t-sm d-flex align-center bg-grey">
+            <v-btn class="ml-2" variant="text" icon size="small">
+              <v-icon icon="mdi-cog" />
+              <v-menu activator="parent">
+                <v-list density="compact">
+                  <v-list-item
+                    :title="$gettext('Create a new mailbox')"
+                    prepend-icon="mdi-plus"
+                    @click="openMailboxForm"
+                  />
+                  <v-list-item
+                    :title="$gettext('Edit this mailbox')"
+                    prepend-icon="mdi-pencil"
+                    :disabled="readOnlyMailbox"
+                    @click="editMailbox"
+                  />
+                  <v-list-item
+                    :title="$gettext('Delete this mailbox')"
+                    prepend-icon="mdi-trash-can"
+                    :disabled="readOnlyMailbox"
+                    @click="deleteMailbox"
+                  />
+                  <v-list-item
+                    v-if="webmailStore.sharingEnabled"
+                    :title="$gettext('Share this mailbox')"
+                    prepend-icon="mdi-share-variant-outline"
+                    :disabled="webmailStore.isShared(currentMailbox)"
+                    @click="showShareDialog = true"
+                  />
+                  <v-list-item
+                    :title="$gettext('Compress this mailbox')"
+                    prepend-icon="mdi-folder-zip-outline"
+                    :disabled="!webmailStore.hasRights('e')"
+                    @click="compressMailbox"
+                  />
+                  <v-list-item
+                    :title="$gettext('Subscriptions')"
+                    prepend-icon="mdi-checkbox-multiple-marked-outline"
+                    @click="showSubscriptions = true"
+                  />
+                </v-list>
+              </v-menu>
+            </v-btn>
+
+            <v-progress-linear
+              v-if="mailboxQuota"
+              :color="quotaColor"
+              :model-value="mailboxQuota.usage"
+              :title="mailboxQuotaTitle"
+            />
+          </div>
+        </template>
+      </v-navigation-drawer>
+    </template>
+    <!-- Every view of the webmail starts under the same title, which
+         keeps them clear of the top menu and in the same place from
+         the listing to a message -->
+    <template #header>
+      <div class="text-headline-medium ml-4 mb-4 flex-0-0">
+        {{ $gettext('Webmail') }}
+      </div>
+    </template>
+  </ConnectedLayout>
+  <v-dialog v-model="showMailboxForm" max-width="800">
+    <MailboxForm
+      :user-mailboxes="userMailboxes"
+      :mailbox="editedMailbox"
+      :hdelimiter="hdelimiter"
+      @mailbox-renamed="navigateToMailbox"
+      @close="closeMailboxForm()"
+    />
+  </v-dialog>
+  <v-dialog v-model="showShareDialog" max-width="800">
+    <MailboxShareDialog
+      v-if="showShareDialog"
+      :mailbox="currentMailbox"
+      @close="showShareDialog = false"
+    />
+  </v-dialog>
+  <v-dialog v-model="showSubscriptions" max-width="600">
+    <SubscriptionsDialog
+      @close="showSubscriptions = false"
+      @updated="fetchUserMailboxes"
+    />
+  </v-dialog>
+  <ConfirmDialog ref="confirm" />
+</template>
+
+<script setup>
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { useGettext } from 'vue3-gettext'
+import { useBusStore, useWebmailStore } from '@/stores'
+import { useLogos } from '@/composables/logos'
+import ConfirmDialog from '@/components/tools/ConfirmDialog.vue'
+import ConnectedLayout from '@/layouts/connected/ConnectedLayout.vue'
+import MailboxForm from '@/components/webmail/MailboxForm.vue'
+import MailboxList from '@/components/webmail/MailboxList.vue'
+import MailboxShareDialog from '@/components/webmail/MailboxShareDialog.vue'
+import SubscriptionsDialog from '@/components/webmail/SubscriptionsDialog.vue'
+import api from '@/api/webmail'
+
+const { $gettext } = useGettext()
+const route = useRoute()
+const router = useRouter()
+const busStore = useBusStore()
+const webmailStore = useWebmailStore()
+const { menuLogoPath } = useLogos()
+
+const confirm = ref()
+const drawer = ref(true)
+const rail = ref(false)
+const drawerWidth = ref(256)
+const isResizing = ref(false)
+
+function startResize(e) {
+  e.preventDefault()
+  isResizing.value = true
+  const onMouseMove = (event) => {
+    const newWidth = Math.min(Math.max(event.clientX, 200), 600)
+    drawerWidth.value = newWidth
+  }
+  const onMouseUp = () => {
+    isResizing.value = false
+    document.removeEventListener('mousemove', onMouseMove)
+    document.removeEventListener('mouseup', onMouseUp)
+  }
+  document.addEventListener('mousemove', onMouseMove)
+  document.addEventListener('mouseup', onMouseUp)
+}
+const editedMailbox = ref(null)
+const hdelimiter = ref(null)
+const mailboxQuota = ref(null)
+const selectedMailbox = ref(route.query.mailbox || 'INBOX')
+const showMailboxForm = ref(false)
+const showSubscriptions = ref(false)
+const showShareDialog = ref(false)
+const userMailboxes = ref([])
+
+const currentMailbox = computed(() => route.query.mailbox || 'INBOX')
+
+// The webmail relies on INBOX and on special folders (drafts, sent, junk,
+// trash...): they can't be renamed nor deleted. Their names are user
+// preferences, so they are recognized by the type the API gives them in the
+// mailboxes list.
+// A folder shared by someone else can only be changed with the "x" right.
+const readOnlyMailbox = computed(() => {
+  const name = currentMailbox.value
+  return (
+    name.toUpperCase() === 'INBOX' ||
+    userMailboxes.value.some(
+      (mailbox) => mailbox.name === name && mailbox.type !== 'normal'
+    ) ||
+    (webmailStore.isShared(name) && !webmailStore.hasRights('x'))
+  )
+})
+
+const quotaColor = computed(() => {
+  if (mailboxQuota.value.usage < 50) {
+    return 'info'
+  }
+  if (mailboxQuota.value.usage < 80) {
+    return 'warning'
+  }
+  return 'error'
+})
+
+const mailboxQuotaTitle = computed(() => {
+  return `${mailboxQuota.value.current} / ${mailboxQuota.value.limit} (${mailboxQuota.value.usage}%)`
+})
+
+const dataKey = computed(() => busStore.dataKey)
+
+function updateMailboxUnseen(mailboxes, name, counter) {
+  for (const mailbox of mailboxes) {
+    if (mailbox.name === name) {
+      mailbox.unseen = counter
+      return true
+    }
+    if (
+      mailbox.sub &&
+      mailbox.sub.length &&
+      updateMailboxUnseen(mailbox.sub, name, counter)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+function refreshMailboxUnseen(mailbox) {
+  api.getUserMailboxUnseen(mailbox).then((resp) => {
+    updateMailboxUnseen(userMailboxes.value, mailbox, resp.data.counter)
+  })
+}
+
+function openMailbox(mailbox) {
+  router.push({
+    name: 'MailboxView',
+    query: { mailbox },
+  })
+  api.getUserMailboxQuota(mailbox).then((resp) => {
+    mailboxQuota.value = resp.data
+  })
+  // The counter of the mailbox comes with its listing
+}
+
+const fetchUserMailboxes = async () => {
+  const resp = await api.getUserMailboxes()
+  userMailboxes.value = resp.data.mailboxes
+  // Let child views recognize special folders whatever their names
+  webmailStore.setMailboxes(resp.data.mailboxes, {
+    sharingEnabled: resp.data.sharing_enabled,
+    hdelimiter: resp.data.hdelimiter,
+  })
+  hdelimiter.value = resp.data.hdelimiter
+}
+
+// The actions offered in a shared folder depend on the rights of the user
+async function fetchMailboxRights(mailbox) {
+  webmailStore.mailboxRights = null
+  if (!webmailStore.sharingEnabled || !webmailStore.isShared(mailbox)) {
+    return
+  }
+  const resp = await api.getMailboxRights(mailbox)
+  // Another mailbox may have been opened meanwhile
+  if (mailbox === currentMailbox.value) {
+    webmailStore.mailboxRights = resp.data.rights
+  }
+}
+
+const openComposeForm = () => {
+  router.push({ name: 'ComposeEmailView' })
+}
+
+const closeMailboxForm = () => {
+  showMailboxForm.value = false
+  editedMailbox.value = null
+  fetchUserMailboxes()
+}
+
+const openMailboxForm = () => {
+  showMailboxForm.value = true
+}
+
+const editMailbox = () => {
+  editedMailbox.value = selectedMailbox.value
+  showMailboxForm.value = true
+}
+
+const navigateToMailbox = (mailbox) => {
+  selectedMailbox.value = mailbox
+  router.push({
+    name: 'MailboxView',
+    query: { mailbox },
+  })
+}
+
+const compressMailbox = async () => {
+  await api.compressUserMailbox({ name: selectedMailbox.value })
+  busStore.displayNotification({ msg: $gettext('Mailbox compressed') })
+}
+
+const deleteMailbox = async () => {
+  const confirmed = await confirm.value.open(
+    $gettext('Warning'),
+    $gettext('Delete this mailbox?'),
+    {
+      color: 'warning',
+      agreeLabel: $gettext('Yes'),
+      cancelLabel: $gettext('No'),
+    }
+  )
+  if (!confirmed) {
+    return
+  }
+  await api.deleteUserMailbox({ name: selectedMailbox.value })
+  busStore.displayNotification({ msg: $gettext('Mailbox deleted') })
+  navigateToMailbox('INBOX')
+}
+
+watch(dataKey, () => {
+  fetchUserMailboxes()
+})
+
+watch(currentMailbox, fetchMailboxRights)
+
+// Counters received along the listings
+watch(
+  () => webmailStore.unseenCounters,
+  (counters) => {
+    for (const [name, counter] of Object.entries(counters)) {
+      updateMailboxUnseen(userMailboxes.value, name, counter)
+    }
+  },
+  { deep: true }
+)
+
+watch(
+  () => busStore.mbCounterKey,
+  () => {
+    refreshMailboxUnseen(route.query.mailbox || 'INBOX')
+  }
+)
+
+await fetchUserMailboxes()
+fetchMailboxRights(currentMailbox.value)
+const resp = await api.getUserMailboxQuota(route.query.mailbox || 'INBOX')
+mailboxQuota.value = resp.data
+</script>
+
+<style scoped>
+.resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 4px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 100;
+}
+.resize-handle:hover {
+  background-color: rgba(0, 0, 0, 0.12);
+}
+</style>

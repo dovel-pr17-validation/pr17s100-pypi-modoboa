@@ -1,0 +1,445 @@
+"""Calendar viewsets."""
+
+import os
+
+import dateutil
+
+from django import http
+from django.utils.translation import gettext as _
+
+from caldav.lib import error as caldav_error
+from drf_spectacular.utils import extend_schema
+from oauth2_provider.contrib.rest_framework import OAuth2Authentication
+from rest_framework.decorators import action
+from rest_framework import exceptions, mixins, permissions, response, viewsets
+
+from modoboa.admin import models as admin_models
+from modoboa.lib.web_utils import size2integer
+
+from . import backends
+from . import models
+from . import rights
+from . import serializers
+from . import subscriptions
+from .permissions import IsRadicale
+
+
+def parse_date_from_iso(value):
+    """Return a tz aware datetime parsed from an ISO date."""
+    return dateutil.parser.parse(value)
+
+
+class CheckTokenMixin:
+    """Mixin to provide the check_token feature."""
+
+    calendar_class = None
+
+    @action(
+        detail=False,
+        methods=["post"],
+        serializer_class=serializers.CheckTokenSerializer,
+    )
+    def check_token(self, request):
+        """Check token validity."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        calendar = self.calendar_class.objects.filter(
+            _path=serializer.validated_data["calendar"]
+        ).first()
+        if not calendar:
+            raise http.Http404()
+        if calendar.access_token != serializer.validated_data["token"]:
+            return response.Response({"status": "ko"})
+        return response.Response({"status": "ok"})
+
+
+class UserCalendarViewSet(CheckTokenMixin, viewsets.ModelViewSet):
+    """Calendar viewset."""
+
+    calendar_class = models.UserCalendar
+    permission_classes = (
+        permissions.IsAuthenticated,
+        permissions.DjangoModelPermissions,
+    )
+    serializer_class = serializers.UserCalendarSerializer
+
+    def get_queryset(self):
+        """Filter based on current user."""
+        qset = models.UserCalendar.objects.filter(mailbox__user=self.request.user)
+        return qset
+
+
+class CalendarSharedWithMeViewSet(
+    mixins.ListModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet
+):
+    """Calendars other users share with the current user.
+
+    Calendars are identified by their pk. Only their display settings
+    can be modified.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.SharedWithMeCalendarSerializer
+    lookup_field = "calendar"
+    lookup_url_kwarg = "pk"
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.AccessRule.objects.none()
+        return (
+            rights.get_rules_shared_with(self.request.user)
+            .select_related("calendar__mailbox__domain")
+            .order_by(
+                "calendar__name",
+                "calendar__mailbox__domain__name",
+                "calendar__mailbox__address",
+            )
+        )
+
+
+class CalendarSubscriptionViewSet(viewsets.ModelViewSet):
+    """Subscriptions of the current user to external iCalendar feeds."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.CalendarSubscriptionSerializer
+
+    def get_queryset(self):
+        return models.CalendarSubscription.objects.filter(
+            mailbox__user=self.request.user
+        )
+
+    @extend_schema(responses=serializers.ROEventSerializer(many=True))
+    @action(detail=True, methods=["get"])
+    def events(self, request, pk):
+        """Return the events of the feed (read-only)."""
+        start = request.GET.get("start")
+        end = request.GET.get("end")
+        if not start or not end:
+            return response.Response()
+        subscription = self.get_object()
+        try:
+            events = subscriptions.get_events(
+                subscription, parse_date_from_iso(start), parse_date_from_iso(end)
+            )
+        except subscriptions.FeedError as exc:
+            raise FeedUnavailable(str(exc)) from exc
+        serializer = serializers.ROEventSerializer(
+            events, many=True, calendar_type="user"
+        )
+        return response.Response(serializer.data)
+
+
+class FeedUnavailable(exceptions.APIException):
+    status_code = 502
+
+
+class SharedCalendarViewSet(CheckTokenMixin, viewsets.ModelViewSet):
+    """Shared calendar viewset."""
+
+    calendar_class = models.SharedCalendar
+    permission_classes = (
+        permissions.IsAuthenticated,
+        permissions.DjangoModelPermissions,
+    )
+    serializer_class = serializers.SharedCalendarSerializer
+
+    def get_queryset(self):
+        """Filter based on current user."""
+        if self.request.user.role == "SimpleUsers":
+            return models.SharedCalendar.objects.filter(
+                domain=self.request.user.mailbox.domain
+            )
+        return models.SharedCalendar.objects.filter(
+            domain__in=admin_models.Domain.objects.get_for_admin(self.request.user)
+        )
+
+
+class BaseEventViewSet(viewsets.ViewSet):
+    """Event viewset."""
+
+    lookup_value_regex = r"[0-9a-zA-Z\-\.@]+"
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def handle_exception(self, exc):
+        """Return a meaningful status when the CalDAV server refuses a request.
+
+        For example, an access rule can be removed while its calendar
+        is displayed.
+        """
+        if isinstance(exc, caldav_error.AuthorizationError):
+            exc = exceptions.PermissionDenied()
+        elif isinstance(exc, caldav_error.NotFoundError):
+            exc = exceptions.NotFound()
+        return super().handle_exception(exc)
+
+    def get_serializer(self, data=None, **kwargs):
+        args = []
+        options = {
+            "context": {"request": self.request},
+            "calendar_type": self.type,
+        }
+        options.update(kwargs)
+        if data is None:
+            data = self.request.data
+        if self.action in ["list", "retrieve"]:
+            sclass = serializers.ROEventSerializer
+            args = [data]
+        else:
+            sclass = serializers.WritableEventSerializer
+            options.update({"data": data})
+        return sclass(*args, **options)
+
+    def create(self, request, calendar_pk):
+        """Create new event."""
+        serializer = self.get_serializer()
+        serializer.is_valid(raise_exception=True)
+        backend = backends.get_backend_from_request(
+            "caldav_", request, serializer.validated_data["calendar"]
+        )
+        uid = backend.create_event(serializer.validated_data)
+        event = dict(serializer.validated_data)
+        calendar = serializer.validated_data["calendar"]
+        event["id"] = uid
+        event["color"] = calendar.color
+        event["calendar"] = {"pk": calendar.pk}
+        if self.type == "shared":
+            event["calendar"]["domain"] = calendar.domain.pk
+        return response.Response(event, status=201)
+
+    def _update_event(self, pk, calendar, data):
+        """Update an event, return an error response if not possible."""
+        new_calendar = data.get("calendar")
+        if (
+            data.get("scope") == "occurrence"
+            and new_calendar
+            and new_calendar.pk != calendar.pk
+        ):
+            return response.Response(
+                {"calendar": [_("An occurrence cannot be moved to another calendar")]},
+                status=400,
+            )
+        backend = backends.get_backend_from_request("caldav_", self.request, calendar)
+        try:
+            backend.update_event(pk, data)
+        except ValueError as exc:
+            return response.Response({"non_field_errors": [str(exc)]}, status=400)
+        return None
+
+    def update(self, request, pk, calendar_pk):
+        """Update existing event."""
+        serializer = self.get_serializer()
+        new_calendar_type = request.data.get("new_calendar_type")
+        if new_calendar_type:
+            serializer.update_calendar_field(new_calendar_type)
+        serializer.is_valid(raise_exception=True)
+        calendar = self.get_calendar(calendar_pk)
+        error = self._update_event(pk, calendar, serializer.validated_data)
+        if error:
+            return error
+        event = dict(serializer.data)
+        event["id"] = pk
+        return response.Response(event, status=200)
+
+    def partial_update(self, request, pk, calendar_pk):
+        """Update existing event."""
+        serializer = self.get_serializer(partial=True)
+        serializer.is_valid(raise_exception=True)
+        calendar = self.get_calendar(calendar_pk)
+        error = self._update_event(pk, calendar, serializer.validated_data)
+        if error:
+            return error
+        return response.Response(status=200)
+
+    def list(self, request, calendar_pk):
+        """Get a list of event."""
+        start = request.GET.get("start")
+        end = request.GET.get("end")
+        if not start or not end:
+            return response.Response()
+        events = []
+        calendar = self.get_calendar(calendar_pk)
+        backend = backends.get_backend_from_request("caldav_", request, calendar)
+        events += backend.get_events(
+            parse_date_from_iso(start), parse_date_from_iso(end)
+        )
+        serializer = self.get_serializer(events, many=True)
+        return response.Response(serializer.data)
+
+    def retrieve(self, request, pk, calendar_pk):
+        """Get a specific event."""
+        calendar = self.get_calendar(calendar_pk)
+        backend = backends.get_backend_from_request("caldav_", request, calendar)
+        event = backend.get_event(pk)
+        serializer = self.get_serializer(event)
+        return response.Response(serializer.data)
+
+    def destroy(self, request, pk, calendar_pk):
+        """Destroy a specific event (or one occurrence of a recurring event)."""
+        serializer = serializers.RecurrenceSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        calendar = self.get_calendar(calendar_pk)
+        backend = backends.get_backend_from_request("caldav_", request, calendar)
+        backend.delete_event(pk, **serializer.validated_data)
+        return response.Response()
+
+    @action(detail=False, methods=["post"])
+    def import_from_file(self, request, calendar_pk):
+        """Import events from file."""
+        serializer = serializers.ImportFromFileSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        calendar = self.get_calendar(calendar_pk)
+        backend = backends.get_backend_from_request("caldav_", request, calendar)
+        ics_file = serializer.validated_data["ics_file"]
+        ics_file.seek(0, os.SEEK_END)
+        size = ics_file.tell()
+        max_size = size2integer(
+            request.localconfig.parameters.get_value("max_ics_file_size")
+        )
+        if size > max_size:
+            return response.Response(
+                {
+                    "ics_file": [
+                        _("Uploaded file is too big (max: {} bytes)").format(max_size)
+                    ]
+                },
+                status=400,
+            )
+        ics_file.seek(0)
+        counter = backend.import_events(ics_file)
+        return response.Response({"counter": counter})
+
+
+class UserEventViewSet(BaseEventViewSet):
+
+    type = "user"
+
+    #: Actions allowed on a calendar shared in read-only mode
+    read_actions = ("list", "retrieve")
+
+    def get_calendar(self, pk):
+        """Return UserCalendar instance.
+
+        The calendar is owned by the current user, or shared with them
+        by an access rule.
+        """
+        user = self.request.user
+        calendar = models.UserCalendar.objects.filter(mailbox__user=user, pk=pk).first()
+        if calendar:
+            return calendar
+        rule = (
+            rights.get_rules_shared_with(user)
+            .filter(calendar__pk=pk)
+            .select_related("calendar")
+            .first()
+        )
+        if not rule:
+            raise http.Http404
+        if not rule.write and self.action not in self.read_actions:
+            raise exceptions.PermissionDenied(
+                _("This calendar is shared with you in read-only mode")
+            )
+        return rule.calendar
+
+
+class SharedEventViewSet(BaseEventViewSet):
+
+    type = "shared"
+
+    def get_calendar(self, pk):
+        """Return SharedCalendar instance scoped to the current user."""
+        user = self.request.user
+        if user.role == "SimpleUsers":
+            qset = models.SharedCalendar.objects.filter(domain=user.mailbox.domain)
+        else:
+            qset = models.SharedCalendar.objects.filter(
+                domain__in=admin_models.Domain.objects.get_for_admin(user)
+            )
+        calendar = qset.filter(pk=pk).first()
+        if not calendar:
+            raise http.Http404
+        return calendar
+
+
+class AttendeeViewSet(viewsets.ReadOnlyModelViewSet):
+    """Attendee viewset."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.AttendeeSerializer
+
+    def list(self, request, *args, **kwargs):
+        """Return attendees available for current user."""
+        domain_pk = request.user.mailbox.domain_id
+        mb_qset = admin_models.Mailbox.objects.filter(
+            domain__pk=domain_pk, domain__enabled=True, user__is_active=True
+        ).exclude(pk=request.user.mailbox.pk)
+        attendees = []
+        for mb in mb_qset:
+            attendees.append(
+                {"display_name": mb.user.fullname, "email": mb.full_address}
+            )
+        serializer = serializers.AttendeeSerializer(
+            attendees, many=True, context={"request": request}
+        )
+        return response.Response(serializer.data)
+
+
+class MailboxViewSet(viewsets.ReadOnlyModelViewSet):
+    """RO mailbox viewset."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.MailboxSerializer
+
+    def get_queryset(self):
+        """Filter queryset based on current user."""
+        return admin_models.Mailbox.objects.get_share_candidates(
+            self.request.user.mailbox
+        )
+
+
+class AccessRuleViewSet(viewsets.ModelViewSet):
+    """AccessRule viewset, nested under a user calendar."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.AccessRuleSerializer
+
+    def get_calendar(self):
+        """Return the parent UserCalendar owned by the current user."""
+        if not hasattr(self, "_calendar"):
+            self._calendar = models.UserCalendar.objects.filter(
+                mailbox__user=self.request.user, pk=self.kwargs["calendar_pk"]
+            ).first()
+            if not self._calendar:
+                raise http.Http404
+        return self._calendar
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.AccessRule.objects.none()
+        return models.AccessRule.objects.filter(
+            calendar=self.get_calendar()
+        ).select_related("mailbox__domain")
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if "calendar_pk" in self.kwargs:
+            context["calendar"] = self.get_calendar()
+        return context
+
+
+class RightsViewSet(viewsets.GenericViewSet):
+    """Rights of a user, requested by the Radicale server.
+
+    See the radicale-modoboa-rights plugin.
+    """
+
+    authentication_classes = [OAuth2Authentication]
+    permission_classes = [IsRadicale]
+    serializer_class = serializers.RightsRequestSerializer
+
+    @extend_schema(responses=serializers.RightsSerializer)
+    def create(self, request):
+        """Return the rights of a user on collections owned by someone else."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = rights.get_user_rights(serializer.validated_data["user"])
+        return response.Response(serializers.RightsSerializer(data).data)

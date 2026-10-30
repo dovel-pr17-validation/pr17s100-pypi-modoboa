@@ -1,0 +1,834 @@
+<template>
+  <v-toolbar
+    class="mail-toolbar mb-2 mx-1 flex-0-0"
+    color="surface"
+    flat
+    border
+    rounded="lg"
+    :height="48"
+  >
+    <v-checkbox
+      v-model="selectAll"
+      class="cell-check"
+      color="primary"
+      density="compact"
+      hide-details
+      :indeterminate="partialSelection"
+      :title="
+        hasSelection
+          ? $gettext('Clear the selection')
+          : $gettext('Select every message of the page')
+      "
+      @update:model-value="toggleAllSelection"
+    />
+
+    <template v-if="hasSelection">
+      <span class="mail-selection-count">{{ selectionLabel }}</span>
+      <div class="mail-toolbar-group">
+        <v-btn
+          v-if="!inScheduledView"
+          icon="mdi-trash-can-outline"
+          color="error"
+          variant="text"
+          size="small"
+          :loading="working"
+          :disabled="!webmailStore.hasRights('te')"
+          :title="$gettext('Delete')"
+          @click="deleteSelection"
+        />
+        <template v-if="!inScheduledView">
+          <v-btn
+            v-if="!isJunkFolder"
+            icon="mdi-fire"
+            color="warning"
+            variant="text"
+            size="small"
+            :loading="working"
+            :disabled="!webmailStore.hasRights('te')"
+            :title="$gettext('Mark as junk')"
+            @click="markSelectionAsJunk"
+          />
+          <v-btn
+            v-else
+            icon="mdi-thumb-up-outline"
+            color="success"
+            variant="text"
+            size="small"
+            :loading="working"
+            :disabled="!webmailStore.hasRights('te')"
+            :title="$gettext('Mark as not junk')"
+            @click="markSelectionAsNotJunk"
+          />
+        </template>
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          :title="$gettext('More actions')"
+        >
+          <v-icon icon="mdi-dots-horizontal" />
+          <v-menu activator="parent">
+            <v-list density="compact">
+              <v-list-item
+                :title="$gettext('Mark as read')"
+                prepend-icon="mdi-eye"
+                :disabled="!webmailStore.hasRights('s')"
+                @click="() => flagSelection('read')"
+              />
+              <v-list-item
+                :title="$gettext('Mark as unread')"
+                prepend-icon="mdi-eye-outline"
+                :disabled="!webmailStore.hasRights('s')"
+                @click="() => flagSelection('unread')"
+              />
+              <v-list-item
+                :title="$gettext('Mark as followed')"
+                prepend-icon="mdi-star"
+                :disabled="!webmailStore.hasRights('w')"
+                @click="() => flagSelection('flagged')"
+              />
+              <v-list-item
+                :title="$gettext('Mark as unfollowed')"
+                prepend-icon="mdi-star-outline"
+                :disabled="!webmailStore.hasRights('w')"
+                @click="() => flagSelection('unflagged')"
+              />
+            </v-list>
+          </v-menu>
+        </v-btn>
+      </div>
+    </template>
+
+    <v-text-field
+      v-else
+      v-model="search"
+      prepend-inner-icon="mdi-magnify"
+      :placeholder="$gettext('Search in messages')"
+      class="mail-search"
+      variant="solo-filled"
+      single-line
+      flat
+      hide-details
+      density="compact"
+      clearable
+      @click:clear="fetchEmails"
+      @keyup.enter="submitSearch"
+    ></v-text-field>
+
+    <div class="mail-toolbar-spacer" />
+
+    <!-- Emptying a mailbox acts on the folder, not on a selection -->
+    <v-btn
+      v-if="isTrashFolder"
+      icon="mdi-delete-sweep-outline"
+      variant="text"
+      size="small"
+      :title="$gettext('Empty mailbox')"
+      @click="emptyMailbox"
+    />
+
+    <template v-if="!inScheduledView">
+      <span class="mail-toolbar-separator" />
+      <v-btn
+        class="mail-mode"
+        variant="text"
+        size="small"
+        :prepend-icon="listingModeIcon"
+        append-icon="mdi-menu-down"
+        :title="$gettext('Display mode')"
+      >
+        <v-menu activator="parent">
+          <v-list density="compact">
+            <v-list-item
+              prepend-icon="mdi-format-list-bulleted"
+              :active="!threadedMode"
+              color="primary"
+              :title="$gettext('Messages one by one')"
+              @click="changeListingMode('flat')"
+            >
+              <template #append>
+                <v-icon v-if="!threadedMode" icon="mdi-check" />
+              </template>
+            </v-list-item>
+            <v-list-item
+              prepend-icon="mdi-forum-outline"
+              :active="threadedMode"
+              color="primary"
+              :title="$gettext('Conversations')"
+              :subtitle="
+                threadingAvailable
+                  ? undefined
+                  : $gettext('Not available in this folder')
+              "
+              :disabled="!threadingAvailable"
+              @click="changeListingMode('threaded')"
+            >
+              <template #append>
+                <v-icon v-if="threadedMode" icon="mdi-check" />
+              </template>
+            </v-list-item>
+          </v-list>
+        </v-menu>
+      </v-btn>
+      <span class="mail-toolbar-separator" />
+    </template>
+
+    <div v-if="emails.results" class="mail-pagination">
+      <span class="mail-range">
+        {{ emails.first_index }}-{{ emails.last_index }} {{ $gettext('on') }}
+        {{ emails.count }}
+      </span>
+      <v-btn
+        icon="mdi-chevron-left"
+        variant="text"
+        size="small"
+        :disabled="emails.prev_page === null"
+        :title="$gettext('Previous page')"
+        @click="page = emails.prev_page"
+      />
+      <v-btn
+        icon="mdi-chevron-right"
+        variant="text"
+        size="small"
+        :disabled="emails.next_page === null"
+        :title="$gettext('Next page')"
+        @click="page = emails.next_page"
+      />
+    </div>
+    <v-progress-linear
+      :active="showProgress"
+      class="mail-toolbar-progress"
+      color="primary"
+      height="2"
+      absolute
+      location="bottom"
+      indeterminate
+    />
+  </v-toolbar>
+  <v-alert
+    v-if="inScheduledView"
+    type="info"
+    variant="tonal"
+    density="compact"
+    class="mx-1 mb-2 flex-0-0"
+  >
+    {{
+      $gettext(
+        'Scheduled messages will be sent at the specified date and time. (visible on the right)'
+      )
+    }}
+  </v-alert>
+  <div
+    class="emails overflow-y-auto"
+    :class="{ 'emails-refreshing': showProgress && !firstLoad }"
+    :aria-busy="loading"
+  >
+    <!-- Nothing to show yet: rows shaped like the real ones -->
+    <div v-if="firstLoad" class="mail-list mx-1">
+      <div
+        v-for="(widths, index) in GHOST_ROWS"
+        :key="index"
+        class="mail-row mail-row-ghost"
+      >
+        <span class="accent" />
+        <span class="cell-check"><span class="ghost-box" /></span>
+        <span class="cell-icon"><span class="ghost-box" /></span>
+        <span class="cell-sender">
+          <span class="ghost-bar" :style="{ width: widths[0] }" />
+        </span>
+        <span class="cell-subject">
+          <span class="ghost-bar" :style="{ width: widths[1] }" />
+        </span>
+        <span class="cell-date"><span class="ghost-bar" /></span>
+      </div>
+    </div>
+    <div v-else-if="emails.results?.length" class="mail-list mx-1">
+      <div class="mail-list-header">
+        <span class="spacer-accent" />
+        <span class="spacer-check" />
+        <span class="spacer-icon" />
+        <span v-if="displayThreads" class="spacer-expand" />
+        <span class="cell-sender">
+          {{ inScheduledView ? $gettext('Recipients') : $gettext('Sender') }}
+        </span>
+        <span class="cell-subject">{{ $gettext('Subject') }}</span>
+        <span class="cell-date">{{ $gettext('Date') }}</span>
+      </div>
+      <template v-if="displayThreads">
+        <ThreadListItem
+          v-for="thread in emails.results"
+          :key="thread.root"
+          :thread="thread"
+          :mailbox="props.mailbox"
+          @open="openEmail"
+          @open-thread="openThread"
+          @toggle-follow="toggleFollowState"
+          @dragstart="onDragStart"
+        />
+      </template>
+      <template v-else>
+        <EmailListItem
+          v-for="email in emails.results"
+          :key="email.imapid"
+          :email="email"
+          :scheduled="inScheduledView"
+          @open="openEmail"
+          @toggle-follow="toggleFollowState"
+          @reschedule="reScheduleMessage"
+          @delete-scheduled="deleteScheduledMessage"
+          @scheduling-error="displaySchedulingError"
+          @dragstart="onDragStart"
+        />
+      </template>
+    </div>
+    <v-alert
+      v-else
+      class="mt-4"
+      type="info"
+      :text="$gettext('No message yet in this mailbox')"
+      variant="tonal"
+    />
+  </div>
+  <v-dialog v-model="showSchedulingForm" max-width="800">
+    <EmailSchedulingForm
+      :initial-date="selectedScheduledEmail.scheduled_datetime_raw"
+      @schedule="updateScheduledEmail"
+      @close="closeSchedulingForm"
+    />
+  </v-dialog>
+  <v-dialog v-model="showSchedulingError" max-width="400">
+    <v-card
+      max-width="400"
+      :text="schedulingError"
+      :title="$gettext('Sending failure')"
+    >
+      <template #:actions>
+        <v-btn
+          class="ms-auto"
+          :text="$gettext('Close')"
+          @click="showSchedulingError = false"
+        ></v-btn>
+      </template>
+    </v-card>
+  </v-dialog>
+</template>
+
+<script setup>
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
+import { useGettext } from 'vue3-gettext'
+import { useBusStore, useWebmailStore } from '@/stores'
+import { useSpecialFolders } from '@/composables/webmail'
+import EmailListItem from './EmailListItem.vue'
+import EmailSchedulingForm from './EmailSchedulingForm.vue'
+import ThreadListItem from './ThreadListItem.vue'
+import api from '@/api/webmail'
+import parametersApi from '@/api/parameters'
+
+const props = defineProps({
+  mailbox: {
+    type: String,
+    default: 'INBOX',
+  },
+})
+
+const { $gettext, $ngettext } = useGettext()
+const { displayNotification } = useBusStore()
+const webmailStore = useWebmailStore()
+const router = useRouter()
+const route = useRoute()
+
+// Coming back from a message: the listing left is displayed at once, and
+// only requested again if the mailbox changed meanwhile
+const cachedListing =
+  webmailStore.lastListing?.mailbox === props.mailbox
+    ? webmailStore.lastListing
+    : null
+
+const selectedScheduledEmail = ref(null)
+// A request is in progress, and it has lasted long enough to be shown:
+// quick answers don't make anything blink
+const loading = ref(false)
+const showProgress = ref(false)
+const loadFailed = ref(false)
+const emails = ref(cachedListing?.data || {})
+const page = ref(cachedListing?.page || 1)
+const schedulingError = ref('')
+const search = ref(cachedListing?.search || '')
+const selectAll = ref(false)
+const showSchedulingError = ref(false)
+const showSchedulingForm = ref(false)
+const working = ref(false)
+// null until the server tells whether it supports the THREAD extension
+const threadingSupported = ref(cachedListing?.threadingSupported ?? null)
+// Whether the results currently held by `emails` are threads
+const displayThreads = ref(cachedListing?.threaded || false)
+const userPreferences = ref(null)
+
+let intervalId = null
+let unmounted = false
+// Which listing the last request asked for, to avoid fetching twice
+let lastFetchWasThreaded = cachedListing ? cachedListing.threaded : null
+// Used when the refresh_interval preference can't be read
+const DEFAULT_REFRESH_INTERVAL = 300
+// Delay before a request in progress gets an indicator
+const PROGRESS_DELAY = 200
+// Widths of the sender and the subject of the placeholder rows
+const GHOST_ROWS = [
+  ['60%', '70%'],
+  ['80%', '45%'],
+  ['50%', '60%'],
+  ['70%', '80%'],
+  ['55%', '50%'],
+  ['75%', '65%'],
+]
+let progressTimeout = null
+// Only the answer to the last request is displayed
+let lastRequestId = 0
+
+// No listing received yet: placeholder rows stand in for it
+const firstLoad = computed(
+  () => emails.value.results === undefined && !loadFailed.value
+)
+
+const currentMailbox = computed(() => {
+  return route.query.mailbox || 'INBOX'
+})
+
+const inScheduledView = computed(() => props.mailbox === 'Scheduled')
+
+const { isDraftsFolder, isJunkFolder, isTrashFolder } =
+  useSpecialFolders(currentMailbox)
+
+const listingMode = computed(() => webmailStore.listingMode)
+
+// Every message of the page, one entry per message even in conversation
+// mode: that is what the bulk actions are given
+const pageIds = computed(() => {
+  const results = emails.value.results || []
+  return displayThreads.value
+    ? results.flatMap((thread) => thread.uids || [])
+    : results.map((email) => email.imapid)
+})
+
+const hasSelection = computed(() => webmailStore.selection.length > 0)
+
+const partialSelection = computed(
+  () =>
+    hasSelection.value && webmailStore.selection.length < pageIds.value.length
+)
+
+const selectionLabel = computed(() => {
+  const count = webmailStore.selection.length
+  return $ngettext(
+    '%{count} message selected',
+    '%{count} messages selected',
+    count,
+    { count }
+  )
+})
+
+// Conversations make no sense where messages have no reply chain, and
+// the server may simply not support them
+const threadingAvailable = computed(
+  () =>
+    !inScheduledView.value &&
+    !isDraftsFolder.value &&
+    threadingSupported.value !== false
+)
+
+const threadedMode = computed(
+  () => listingMode.value === 'threaded' && threadingAvailable.value
+)
+
+const listingModeIcon = computed(() =>
+  threadedMode.value ? 'mdi-forum-outline' : 'mdi-format-list-bulleted'
+)
+
+const changeListingMode = (mode) => {
+  if (mode === listingMode.value) {
+    return
+  }
+  webmailStore.setListingMode(mode)
+  webmailStore.selection = []
+  page.value = 1
+  fetchEmails()
+  saveListingMode(mode)
+}
+
+const saveListingMode = async (mode) => {
+  if (!userPreferences.value) {
+    return
+  }
+  try {
+    await parametersApi.saveUserApplication('webmail', {
+      ...userPreferences.value,
+      listing_mode: mode,
+    })
+    userPreferences.value.listing_mode = mode
+  } catch {
+    // The mode still applies to this session
+  }
+}
+
+const reScheduleMessage = (email) => {
+  selectedScheduledEmail.value = email
+  showSchedulingForm.value = true
+}
+
+const updateScheduledEmail = async (datetime) => {
+  const data = {
+    scheduled_datetime: datetime,
+  }
+  await api.updateScheduledMessage(
+    selectedScheduledEmail.value.scheduled_id,
+    data
+  )
+  fetchEmails()
+  displayNotification({ msg: $gettext('Scheduling updated') })
+}
+
+const closeSchedulingForm = () => {
+  showSchedulingForm.value = false
+}
+
+const deleteScheduledMessage = async (email) => {
+  await api.deleteScheduledMessage(email.scheduled_id)
+  fetchEmails()
+  displayNotification({
+    msg: $gettext('Scheduled canceled and message moved to trash folder'),
+  })
+}
+
+const displaySchedulingError = async (email) => {
+  const resp = await api.getScheduledMessage(email.scheduled_id)
+  schedulingError.value = resp.data.error
+  showSchedulingError.value = true
+}
+
+const openEmail = (emailid) => {
+  const id = String(emailid)
+  const unread = (emails.value.results || []).some((item) =>
+    displayThreads.value
+      ? item.unseen_count > 0 && item.uids.map(String).includes(id)
+      : String(item.imapid) === id && item.style === 'unseen'
+  )
+  if (unread) {
+    // It must be requested to be marked as read
+    webmailStore.forgetContent(props.mailbox, emailid)
+  }
+  router.push({
+    name: 'EmailView',
+    query: { mailbox: props.mailbox, mailid: emailid },
+  })
+}
+
+const openThread = (mailid) => {
+  router.push({
+    name: 'ThreadView',
+    query: { mailbox: props.mailbox, mailid },
+  })
+}
+
+const startLoading = () => {
+  loading.value = true
+  clearTimeout(progressTimeout)
+  progressTimeout = setTimeout(() => {
+    showProgress.value = true
+  }, PROGRESS_DELAY)
+}
+
+const stopLoading = () => {
+  clearTimeout(progressTimeout)
+  loading.value = false
+  showProgress.value = false
+}
+
+// The listing on screen stays there until the new one arrives. A silent
+// fetch, used by the periodic refresh, shows no indicator at all.
+const fetchEmails = ({ silent = false } = {}) => {
+  const requestId = ++lastRequestId
+  loadFailed.value = false
+  if (!silent) {
+    startLoading()
+  }
+  const options = { page: page.value, search: search.value }
+  const threaded = threadedMode.value
+  lastFetchWasThreaded = threaded
+  const request = threaded
+    ? api.getMailboxThreads(props.mailbox, options)
+    : api.getMailboxEmails(props.mailbox, options)
+  request
+    .then((resp) => {
+      if (requestId !== lastRequestId) {
+        return
+      }
+      if (resp.data.threading_supported !== undefined) {
+        threadingSupported.value = resp.data.threading_supported
+        if (!resp.data.threading_supported) {
+          // The server can't thread: fall back to the flat listing
+          fetchEmails({ silent })
+          return
+        }
+      }
+      // What is displayed follows the results, never the preference:
+      // the mode can change before the matching request comes back,
+      // and threads and messages don't carry the same fields
+      displayThreads.value = threaded
+      emails.value = resp.data
+      stopLoading()
+      webmailStore.lastListing = {
+        mailbox: props.mailbox,
+        page: options.page,
+        search: options.search,
+        threaded,
+        threadingSupported: threadingSupported.value,
+        data: emails.value,
+      }
+      // The listing carries the counter of the mailbox
+      webmailStore.setUnseen(props.mailbox, resp.data.unseen)
+    })
+    .catch(() => {
+      if (requestId === lastRequestId) {
+        loadFailed.value = true
+        stopLoading()
+      }
+    })
+}
+
+// Polled: a cheap status request tells whether the mailbox changed since
+// the listing was received, and the listing is only requested again then.
+const autoRefreshContent = async () => {
+  if (document.hidden || loading.value) {
+    return
+  }
+  const knownState = emails.value.state
+  if (knownState) {
+    try {
+      const resp = await api.getUserMailboxStatus(props.mailbox)
+      webmailStore.setUnseen(props.mailbox, resp.data.unseen)
+      if (resp.data.state === knownState) {
+        return
+      }
+    } catch {
+      // The listing would fail the same way
+      return
+    }
+  }
+  fetchEmails({ silent: true })
+}
+
+// Refreshes are skipped while the page is hidden: catch up when it
+// shows again
+const onVisibilityChange = () => {
+  if (!document.hidden) {
+    autoRefreshContent()
+  }
+}
+
+const submitSearch = () => {
+  fetchEmails()
+}
+
+const toggleAllSelection = (value) => {
+  webmailStore.selection = value ? [...pageIds.value] : []
+}
+
+// The messages are updated on screen right away. The listing is then
+// requested again: it fills the page, or brings the messages back if the
+// request failed.
+const runOnSelection = async (request, msg, update) => {
+  const selection = [...webmailStore.selection]
+  if (!selection.length) {
+    return
+  }
+  const mailbox = currentMailbox.value
+  working.value = true
+  update(mailbox, selection)
+  webmailStore.selection = []
+  try {
+    await request(mailbox, selection)
+    displayNotification({ msg })
+  } finally {
+    working.value = false
+    fetchEmails({ silent: true })
+  }
+}
+
+const removeSelection = (request, msg) =>
+  runOnSelection(request, msg, webmailStore.removeFromListing)
+
+const deleteSelection = () =>
+  removeSelection(api.deleteSelection, $gettext('Message(s) deleted'))
+
+const markSelectionAsJunk = () =>
+  removeSelection(
+    api.markSelectionAsJunk,
+    $gettext('Message(s) marked as junk')
+  )
+
+const markSelectionAsNotJunk = () =>
+  removeSelection(
+    api.markSelectionAsNotJunk,
+    $gettext('Message(s) marked as not junk')
+  )
+
+const flagSelection = (status) =>
+  runOnSelection(
+    (mailbox, selection) => api.flagSelection(mailbox, selection, status),
+    $gettext('Message(s) flagged'),
+    (mailbox, selection) => {
+      webmailStore.flagInListing(mailbox, selection, status)
+      if (status === 'unread') {
+        selection.forEach((id) => webmailStore.forgetContent(mailbox, id))
+      }
+    }
+  )
+
+const emptyMailbox = () => {
+  startLoading()
+  api.emptyUserMailbox(currentMailbox.value).then(() => {
+    webmailStore.setUnseen(currentMailbox.value, 0)
+    fetchEmails()
+  })
+}
+
+const toggleFollowState = async (email) => {
+  const flag = email.flagged ? 'unflagged' : 'flagged'
+  await api.flagSelection(currentMailbox.value, [email.imapid], flag)
+  email.flagged = flag === 'flagged'
+}
+
+// The event is passed explicitly: window.event doesn't exist in Firefox.
+// ``ids`` holds one message, or every message of a conversation.
+const onDragStart = (event, ids) => {
+  if (!ids.some((id) => webmailStore.selection.includes(id))) {
+    webmailStore.selection = [...ids]
+  }
+  const ghost = document.createElement('div')
+  const count = webmailStore.selection.length || 0
+  const msg = $ngettext('%{count} message', '%{count} messages', count, {
+    count,
+  })
+  ghost.innerHTML = `
+    <div class="pa-4 rounded-lg" style="background: #a9a9a9; opacity: 0.8; width: 300px">
+      <div style="font-weight: 600">${msg}</div>
+    </div>
+  `
+  document.body.appendChild(ghost)
+  // Firefox doesn't start dragging when no data is set
+  event.dataTransfer.setData('text/plain', webmailStore.selection.join(','))
+  event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.setDragImage(ghost, -10, -10)
+  setTimeout(() => ghost.remove(), 0)
+}
+
+// Read the preferences the listing depends on: the refresh rate and the
+// listing mode. Unset values are returned as null but refused on save,
+// so they are dropped before keeping the payload for later updates.
+const loadPreferences = async () => {
+  if (webmailStore.preferences) {
+    userPreferences.value = webmailStore.preferences.params
+    return webmailStore.preferences.interval
+  }
+  try {
+    const resp = await parametersApi.getUserApplication('webmail')
+    const params = resp.data.params || {}
+    userPreferences.value = Object.fromEntries(
+      Object.entries(params).filter(([, value]) => value !== null)
+    )
+    if (!webmailStore.listingModeLoaded) {
+      webmailStore.setListingMode(params.listing_mode)
+    }
+    const value = Number(params.refresh_interval)
+    const interval =
+      Number.isInteger(value) && value > 0 ? value : DEFAULT_REFRESH_INTERVAL
+    webmailStore.preferences = { params: userPreferences.value, interval }
+    return interval
+  } catch {
+    // Keep refreshing with the default interval
+  }
+  return DEFAULT_REFRESH_INTERVAL
+}
+
+onMounted(async () => {
+  if (cachedListing) {
+    autoRefreshContent()
+  } else if (webmailStore.listingModeLoaded) {
+    // The mode is known from a previous listing: don't wait
+    fetchEmails()
+  }
+  const interval = await loadPreferences()
+  if (unmounted) {
+    return
+  }
+  if (threadedMode.value !== lastFetchWasThreaded) {
+    fetchEmails()
+  }
+  intervalId = setInterval(autoRefreshContent, interval * 1000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+})
+
+onUnmounted(() => {
+  unmounted = true
+  clearInterval(intervalId)
+  clearTimeout(progressTimeout)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
+
+watch(
+  () => props.mailbox,
+  () => {
+    webmailStore.selection = []
+    search.value = ''
+    // The messages of the previous mailbox mustn't linger meanwhile
+    emails.value = {}
+    if (page.value !== 1) {
+      // The page watcher fetches the listing
+      page.value = 1
+      return
+    }
+    fetchEmails()
+  }
+)
+watch(
+  () => webmailStore.selection,
+  () => {
+    if (!webmailStore.selection.length) {
+      selectAll.value = false
+    } else {
+      selectAll.value = true
+    }
+  }
+)
+watch(
+  () => webmailStore.listingKey,
+  () => {
+    // Messages were moved out of the listing, which stays displayed
+    fetchEmails({ silent: true })
+  }
+)
+watch(page, () => {
+  // The actions would otherwise apply to messages of another page
+  webmailStore.selection = []
+  fetchEmails()
+})
+</script>
+
+<style lang="scss" scoped>
+/* The listing fills what the toolbar leaves, and scrolls on its own.
+   It used to be positioned absolutely under a hardcoded 150px offset,
+   which had to be kept in step with the height of everything above. */
+.emails {
+  flex: 1 1 auto;
+  min-height: 0;
+  transition: opacity 0.2s ease;
+}
+
+/* A new listing is on its way: the current one stays, faded, and can't
+   be acted on anymore */
+.emails-refreshing {
+  opacity: 0.55;
+  pointer-events: none;
+}
+</style>

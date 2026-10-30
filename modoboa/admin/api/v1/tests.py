@@ -1,0 +1,1185 @@
+"""Admin API related tests."""
+
+import copy
+import json
+from unittest import mock
+
+import dns.resolver
+
+from django.core.cache import cache
+from django.test import override_settings
+from django.urls import reverse
+
+from django.contrib.auth import authenticate
+
+from rest_framework.authtoken.models import Token
+from reversion.models import Version
+
+from modoboa.admin import factories
+from modoboa.admin import models
+from modoboa.admin import signals as admin_signals
+from modoboa.admin.tests import utils
+from modoboa.core import factories as core_factories, models as core_models
+from modoboa.lib.permissions import grant_access_to_object
+from modoboa.lib.tests import ModoAPITestCase
+
+
+class DomainAPITestCase(ModoAPITestCase):
+    """Check API."""
+
+    @classmethod
+    def setUpTestData(cls):  # NOQA:N802
+        """Create test data."""
+        super().setUpTestData()
+        factories.populate_database()
+        cls.da_token = Token.objects.create(
+            user=core_models.User.objects.get(username="admin@test.com")
+        )
+
+    def test_get_domains(self):
+        """Retrieve a list of domains."""
+        url = reverse("v1:domain-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        domain = response.data[0]
+        url = reverse("v1:domain-detail", args=[domain["pk"]])
+        response = self.client.get(url)
+        data = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["name"], domain["name"])
+        self.assertEqual(data["mailbox_count"], 2)
+
+    def test_create_domain(self):
+        """Check domain creation."""
+        url = reverse("v1:domain-list")
+        response = self.client.post(
+            url, {"name": "test3.com", "quota": 0, "default_mailbox_quota": 10}
+        )
+        self.assertEqual(response.status_code, 201)
+        domain = models.Domain.objects.get(name="test3.com")
+        self.assertEqual(Version.objects.get_for_object(domain).count(), 1)
+
+        response = self.client.post(url, {})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("name", response.data)
+
+        response = self.client.post(
+            url, {"name": "test5.com", "quota": 1, "default_mailbox_quota": 10}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("default_mailbox_quota", response.data)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        response = self.client.post(
+            url, {"name": "test4.com", "default_mailbox_quota": 10}
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_create_utf8(self):
+        """Test the creation of a domain with non-ASCII characters."""
+        url = reverse("v1:domain-list")
+        values = {
+            "name": "pouét.com",
+            "quota": 1000,
+            "default_mailbox_quota": 100,
+            "type": "domain",
+        }
+        response = self.client.post(url, values, format="json")
+        self.assertEqual(response.status_code, 201)
+        dom = models.Domain.objects.get(name="pouét.com")
+        self.assertEqual(dom.name, "pouét.com")
+        self.assertEqual(dom.quota, 1000)
+        self.assertEqual(dom.default_mailbox_quota, 100)
+        self.assertTrue(dom.enabled)
+        self.assertFalse(dom.admins)
+
+    @mock.patch.object(dns.resolver.Resolver, "resolve")
+    @mock.patch("socket.getaddrinfo")
+    def test_create_domain_with_mx_check(self, mock_getaddrinfo, mock_query):
+        """Check domain creation when MX check is activated."""
+        mock_query.side_effect = utils.mock_dns_query_result
+        mock_getaddrinfo.side_effect = utils.mock_ip_query_result
+        self.set_global_parameter("enable_admin_limits", False, app="limits")
+        self.set_global_parameter("valid_mxs", "192.0.2.1 2001:db8::1")
+        self.set_global_parameter("domains_must_have_authorized_mx", True)
+        reseller = core_factories.UserFactory(
+            username="reseller", groups=("Resellers",)
+        )
+        token = Token.objects.create(user=reseller)
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+
+        url = reverse("v1:domain-list")
+        response = self.client.post(
+            url, {"name": "no-mx.example.com", "quota": 0, "default_mailbox_quota": 10}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["name"][0], "No authorized MX record found for this domain"
+        )
+
+        mock_getaddrinfo.side_effect = utils.mock_ip_query_result
+        response = self.client.post(
+            url, {"name": "test4.com", "quota": 0, "default_mailbox_quota": 10}
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_update_domain(self):
+        """Check domain update."""
+        domain = models.Domain.objects.get(name="test.com")
+        models.Mailbox.objects.filter(domain__name="test.com", address="user").update(
+            use_domain_quota=True
+        )
+        url = reverse("v1:domain-detail", args=[domain.pk])
+        response = self.client.put(
+            url, {"name": "test.com", "default_mailbox_quota": 1000}
+        )
+        self.assertEqual(response.status_code, 200)
+        domain.refresh_from_db()
+        self.assertEqual(domain.default_mailbox_quota, 1000)
+        mb = models.Mailbox.objects.get(domain__name="test.com", address="user")
+        self.assertEqual(mb.quota, 1000)
+
+        response = self.client.put(
+            url, {"name": "test42.com", "default_mailbox_quota": 1000}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            models.Mailbox.objects.filter(
+                address="user", domain__name="test42.com"
+            ).exists()
+        )
+
+    def test_patch_domain(self):
+        """Check domain partial update."""
+        domain = models.Domain.objects.get(name="test.com")
+        url = reverse("v1:domain-detail", args=[domain.pk])
+        response = self.client.put(url, {"name": "toto.test"})
+        self.assertEqual(response.status_code, 200)
+        domain.refresh_from_db()
+        self.assertEqual(domain.name, "toto.test")
+
+    def test_remove_dkim_domain(self):
+        """Try to remove DKIM from a domain."""
+        domain = models.Domain.objects.get(name="test.com")
+        url = reverse("v1:domain-detail", args=[domain.pk])
+        response = self.client.put(url, {"name": "test.com", "enable_dkim": False})
+        self.assertEqual(response.status_code, 200)
+        domain.refresh_from_db()
+        self.assertEqual(domain.dkim_private_key_path, "")
+
+    def test_delete_domain(self):
+        """Try to delete a domain."""
+        domain = models.Domain.objects.get(name="test.com")
+        url = reverse("v1:domain-detail", args=[domain.pk])
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(models.Domain.objects.filter(pk=domain.pk).exists())
+
+
+class DomainAliasAPITestCase(ModoAPITestCase):
+    """Check DomainAlias API."""
+
+    @classmethod
+    def setUpTestData(cls):  # NOQA:N802
+        """Create test data."""
+        super().setUpTestData()
+        factories.populate_database()
+        cls.dom_alias1 = factories.DomainAliasFactory(
+            name="dalias1.com", target__name="test.com"
+        )
+        cls.dom_alias2 = factories.DomainAliasFactory(
+            name="dalias2.com", target__name="test2.com"
+        )
+        cls.da_token = Token.objects.create(
+            user=core_models.User.objects.get(username="admin@test.com")
+        )
+
+    def test_get(self):
+        """Retrieve a list of domain aliases."""
+        url = reverse("v1:domain_alias-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        url = reverse("v1:domain_alias-detail", args=[response.data[0]["pk"]])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["name"], "dalias1.com")
+
+        url = reverse("v1:domain_alias-list")
+        response = self.client.get(f"{url}?domain=test.com")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        response = self.client.get(reverse("v1:domain_alias-list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+    def test_post(self):
+        """Try to create a new domain alias."""
+        url = reverse("v1:domain_alias-list")
+        target = models.Domain.objects.get(name="test.com")
+        data = {"name": "dalias3.com", "target": target.pk}
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+
+        dalias = response.json()
+        dalias = models.DomainAlias.objects.filter(pk=dalias["pk"]).first()
+        self.assertEqual(dalias.target, target)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        response = self.client.post(
+            url, {"name": "dalias4.com", "target": target.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def _authenticate_reseller(self):
+        """Authenticate as a reseller administrating test.com only."""
+        self.set_global_parameter("enable_admin_limits", False, app="limits")
+        reseller = core_factories.UserFactory(
+            username="reseller", groups=("Resellers",)
+        )
+        models.Domain.objects.get(name="test.com").add_admin(reseller)
+        token = Token.objects.create(user=reseller)
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+        return reseller
+
+    def test_post_name_of_existing_domain(self):
+        """Check a domain alias can't take the name of a domain."""
+        self._authenticate_reseller()
+        url = reverse("v1:domain_alias-list")
+        target = models.Domain.objects.get(name="test.com")
+        for name in ["test2.com", "TEST2.com"]:
+            response = self.client.post(
+                url, {"name": name, "target": target.pk}, format="json"
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(
+                response.json()["name"][0], "domain with this name already exists"
+            )
+        self.assertFalse(models.DomainAlias.objects.filter(name="test2.com").exists())
+        self.assertFalse(
+            models.Alias.objects.filter(address="@test2.com", internal=True).exists()
+        )
+
+    def test_post_invalid_name(self):
+        """Check domain alias name syntax."""
+        url = reverse("v1:domain_alias-list")
+        target = models.Domain.objects.get(name="test.com")
+        response = self.client.post(
+            url, {"name": "=evil.test", "target": target.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_put(self):
+        """Try to update a domain alias."""
+        dalias = models.DomainAlias.objects.get(name="dalias1.com")
+        url = reverse("v1:domain_alias-detail", args=[dalias.pk])
+        data = {"name": "dalias3.com", "target": dalias.target.pk}
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        dalias.refresh_from_db()
+        self.assertEqual(dalias.name, "dalias3.com")
+        self.assertTrue(dalias.enabled)
+        self.assertFalse(models.Alias.objects.filter(address="@dalias1.com").exists())
+        alias = models.Alias.objects.get(address="@dalias3.com", internal=True)
+        self.assertEqual(
+            list(alias.aliasrecipient_set.values_list("address", flat=True)),
+            ["@test.com"],
+        )
+
+    def test_patch_target(self):
+        """Check internal alias follows target change."""
+        dalias = models.DomainAlias.objects.get(name="dalias1.com")
+        target = models.Domain.objects.get(name="test2.com")
+        url = reverse("v1:domain_alias-detail", args=[dalias.pk])
+        response = self.client.patch(url, {"target": target.pk}, format="json")
+        self.assertEqual(response.status_code, 200)
+        alias = models.Alias.objects.get(address="@dalias1.com", internal=True)
+        self.assertEqual(
+            list(alias.aliasrecipient_set.values_list("address", flat=True)),
+            ["@test2.com"],
+        )
+
+    def test_patch_name_of_existing_domain(self):
+        """Check a domain alias can't be renamed to the name of a domain."""
+        self._authenticate_reseller()
+        url = reverse("v1:domain_alias-list")
+        target = models.Domain.objects.get(name="test.com")
+        response = self.client.post(
+            url, {"name": "parked.example", "target": target.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        pk = response.json()["pk"]
+        url = reverse("v1:domain_alias-detail", args=[pk])
+        response = self.client.patch(url, {"name": "test2.com"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(models.DomainAlias.objects.get(pk=pk).name, "parked.example")
+
+        # Generated alias is removed with the domain alias
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(
+            models.Alias.objects.filter(address="@parked.example").exists()
+        )
+
+    def test_update_legacy_collision(self):
+        """Check a collision created by a previous version can't be used."""
+        reseller = self._authenticate_reseller()
+        new_target = factories.DomainFactory(name="new.example")
+        new_target.add_admin(reseller)
+        url = reverse("v1:domain_alias-list")
+        target = models.Domain.objects.get(name="test.com")
+        response = self.client.post(
+            url, {"name": "parked.example", "target": target.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        pk = response.json()["pk"]
+        # Simulate the state left by the old rename path
+        models.DomainAlias.objects.filter(pk=pk).update(name="test2.com")
+
+        url = reverse("v1:domain_alias-detail", args=[pk])
+        for data in [{"target": new_target.pk}, {"enabled": False}]:
+            response = self.client.patch(url, data, format="json")
+            self.assertEqual(response.status_code, 400)
+        response = self.client.put(
+            url, {"name": "test2.com", "target": new_target.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(models.Alias.objects.filter(address="@test2.com").exists())
+
+        # Renaming away is allowed
+        response = self.client.patch(url, {"name": "other.example"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            models.Alias.objects.filter(
+                address="@other.example", internal=True
+            ).exists()
+        )
+
+    def test_delete(self):
+        """Try to delete an existing domain alias."""
+        dalias = models.DomainAlias.objects.get(name="dalias1.com")
+        url = reverse("v1:domain_alias-detail", args=[dalias.pk])
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(models.DomainAlias.objects.filter(pk=dalias.pk).exists())
+
+
+class AccountAPITestCase(ModoAPITestCase):
+    """Check Account API."""
+
+    ACCOUNT_DATA = {
+        "username": "fromapi@test.com",
+        "role": "SimpleUsers",
+        "password": "Toto1234",
+        "mailbox": {"full_address": "fromapi@test.com", "quota": 10},
+    }
+
+    @classmethod
+    def setUpTestData(cls):  # NOQA:N802
+        """Create test data."""
+        super().setUpTestData()
+        factories.populate_database()
+        cls.da_token = Token.objects.create(
+            user=core_models.User.objects.get(username="admin@test.com")
+        )
+
+    def setUp(self):
+        """Test setup."""
+        super().setUp()
+        self.set_global_parameters(
+            {"enable_admin_limits": False, "enable_domain_limits": False}, app="limits"
+        )
+
+    def tearDown(self):
+        # Make sure API calls do not get throttled
+        cache.clear()
+
+    def test_get_accounts(self):
+        """Retrieve a list of accounts."""
+        url = reverse("v1:account-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 5)
+
+        response = self.client.get(f"{url}?domain=test.com")
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 2)
+
+        response = self.client.get(f"{url}?domain=pouet.com")
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 0)
+
+        response = self.client.get(f"{url}?search=user@test.com")
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 1)
+
+    def test_create_account(self):
+        """Try to create a new account."""
+        url = reverse("v1:account-list")
+        response = self.client.post(url, self.ACCOUNT_DATA, format="json")
+        self.assertEqual(response.status_code, 201)
+
+        account = response.json()
+        user = core_models.User.objects.filter(pk=account["pk"]).first()
+        self.assertIsNot(user, None)
+        self.assertIsNot(user.mailbox, None)
+        domadmin = core_models.User.objects.get(username="admin@test.com")
+        self.assertTrue(domadmin.can_access(user))
+        self.assertIn("pk", account["mailbox"])
+
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        data["username"] = "fromapi_ééé@test.com"
+        data["mailbox"]["full_address"] = data["username"]
+
+        del data["password"]
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+
+        data["password"] = "Toto1234"
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_create_account_with_random_password(self):
+        """Try to create a new account with random password."""
+        url = reverse("v1:account-list")
+        data = dict(self.ACCOUNT_DATA)
+        data["random_password"] = True
+        del data["password"]
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    @override_settings(LANGUAGE_CODE="fr")
+    def test_create_account_default_lang(self):
+        """Try to create a new account with(out) language."""
+        url = reverse("v1:account-list")
+        data = dict(self.ACCOUNT_DATA)
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+        account = response.json()
+        user = core_models.User.objects.filter(pk=account["pk"]).first()
+        self.assertEqual(user.language, "fr")
+
+        user.delete()
+        data["language"] = "pl"
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+        account = response.json()
+        user = core_models.User.objects.filter(pk=account["pk"]).first()
+        self.assertEqual(user.language, data["language"])
+
+    def test_create_domainadmin_account(self):
+        """Try to create a domain admin."""
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        data["domains"] = ["test.com"]
+        data["role"] = "DomainAdmins"
+        url = reverse("v1:account-list")
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+        domain = models.Domain.objects.get(name="test.com")
+        admin = core_models.User.objects.get(pk=response.json()["pk"])
+        self.assertIn(admin, domain.admins)
+
+        response = self.client.get(reverse("v1:account-detail", args=[admin.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("domains", response.json())
+
+        data["username"] = "domain_admin"
+        del data["mailbox"]
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_create_domainadmin_account_non_owned_domain(self):
+        """A reseller must not assign domains it cannot access.
+
+        Regression test: the ``domains`` field used to be validated for
+        existence only, allowing a reseller to grant a planted domain admin
+        full access to another tenant's domain (cross-tenant takeover).
+        """
+        reseller = core_factories.UserFactory(
+            username="reseller", groups=("Resellers",)
+        )
+        # The reseller owns test.com but not test2.com.
+        grant_access_to_object(
+            reseller, models.Domain.objects.get(name="test.com"), is_owner=True
+        )
+        token = Token.objects.create(user=reseller)
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+        url = reverse("v1:account-list")
+
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        del data["mailbox"]
+        data["username"] = "pwn"
+        data["role"] = "DomainAdmins"
+        data["domains"] = ["test2.com"]
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("domains", response.json())
+        self.assertFalse(core_models.User.objects.filter(username="pwn").exists())
+
+        # An owned domain is still accepted.
+        data["domains"] = ["test.com"]
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_create_account_with_no_mailbox(self):
+        """Try to create a new account."""
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        del data["mailbox"]
+        url = reverse("v1:account-list")
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+        account = response.json()
+        user = core_models.User.objects.filter(pk=account["pk"]).first()
+        self.assertIsNot(user, None)
+        self.assertIsNot(user.mailbox, None)
+        self.assertEqual(user.mailbox.quota, user.mailbox.domain.default_mailbox_quota)
+
+    def test_create_existing_account(self):
+        """Check if unicity is respected."""
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        data["username"] = "user@test.com"
+        url = reverse("v1:account-list")
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+
+        data.update({"username": "domainadmin", "role": "DomainAdmins"})
+        data["mailbox"]["full_address"] = "admin@test.com"
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 409)
+
+    def test_create_account_bad_password(self):
+        """Try to create a new account."""
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        data["password"] = "toto"
+        url = reverse("v1:account-list")
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+        errors = response.json()
+        self.assertIn("password", errors)
+
+    def test_create_account_as_domadmin(self):
+        """As DomainAdmin, try to create a new account."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        data["mailbox"]["quota"] = 1000
+        url = reverse("v1:account-list")
+        response = self.client.post(url, data, format="json")
+        # Should fail because domain quota is exceeded
+        self.assertEqual(response.status_code, 400)
+
+        data["username"] = "fromapi@test2.com"
+        data["mailbox"].update({"full_address": "fromapi@test2.com", "quota": 10})
+        response = self.client.post(url, data, format="json")
+        # Should fail because admin has no access to @test2.com domain
+        self.assertEqual(response.status_code, 400)
+        errors = response.json()
+        self.assertIn("mailbox", errors)
+
+    def test_create_account_bad_master_user(self):
+        """Try to create a new account."""
+        data = copy.deepcopy(self.ACCOUNT_DATA)
+        data["master_user"] = True
+        url = reverse("v1:account-list")
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+        errors = response.json()
+        self.assertIn("master_user", errors)
+
+    def test_update_account(self):
+        """Try to update an account."""
+        account = core_models.User.objects.get(username="user@test.com")
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {
+            "username": "fromapi@test.com",
+            "role": account.role,
+            "password": "Toto1234",
+            "mailbox": {
+                "full_address": "fromapi@test.com",
+                "quota": account.mailbox.quota,
+            },
+        }
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        account.mailbox.refresh_from_db()
+        self.assertEqual(account.email, account.mailbox.full_address)
+        self.assertIsNot(
+            authenticate(username=account.username, password="Toto1234"), None
+        )
+
+        del data["password"]
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertIsNot(
+            authenticate(username=account.username, password="Toto1234"), None
+        )
+
+    def test_update_account_with_no_mailbox(self):
+        """Try to disable an account."""
+        account = core_factories.UserFactory(username="reseller", groups=("Resellers",))
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {"username": "reseller", "role": account.role, "is_active": False}
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+
+    def _create_domain_admin_without_mailbox(self):
+        domain = models.Domain.objects.get(name="test.com")
+        account = core_factories.UserFactory(
+            username="nombox", groups=("DomainAdmins",), password="{PLAIN}toto"
+        )
+        domain.add_admin(account)
+        return account, domain
+
+    def test_patch_account_creates_mailbox_with_domain_quota(self):
+        account, domain = self._create_domain_admin_without_mailbox()
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {"mailbox": {"full_address": "nombox@test.com"}}
+        response = self.client.patch(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertTrue(account.mailbox.use_domain_quota)
+        self.assertEqual(account.mailbox.quota, domain.default_mailbox_quota)
+
+    def test_patch_account_creating_mailbox_respects_limit(self):
+        account, domain = self._create_domain_admin_without_mailbox()
+        self.set_global_parameter("enable_domain_limits", True, app="limits")
+        limit = domain.domainobjectlimit_set.get(name="mailboxes")
+        limit.max_value = domain.mailbox_set.count()
+        limit.save()
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {"mailbox": {"full_address": "nombox@test.com"}}
+        response = self.client.patch(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(models.Mailbox.objects.filter(user=account).exists())
+
+    def test_patch_account_mailbox_without_full_address(self):
+        account = core_models.User.objects.get(username="user@test.com")
+        url = reverse("v1:account-detail", args=[account.pk])
+        for mailbox in ({}, {"quota": 20}):
+            response = self.client.patch(url, {"mailbox": mailbox}, format="json")
+            self.assertEqual(response.status_code, 200)
+        account, domain = self._create_domain_admin_without_mailbox()
+        url = reverse("v1:account-detail", args=[account.pk])
+        response = self.client.patch(url, {"mailbox": {"quota": 20}}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_patch_account(self):
+        """Try to patch an account."""
+        account = core_models.User.objects.get(username="user@test.com")
+        old_quota = account.mailbox.quota
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {
+            "username": "fromapi@test.com",
+            "mailbox": {
+                "full_address": "fromapi@test.com",
+            },
+        }
+        response = self.client.patch(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertEqual(account.email, data["username"])
+        self.assertEqual(account.mailbox.quota, old_quota)
+
+    def test_update_domain_admin_account(self):
+        """Try to change administered domains."""
+        account = core_models.User.objects.get(username="admin@test.com")
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {
+            "username": account.username,
+            "role": account.role,
+            "password": "Toto1234",
+            "mailbox": {
+                "full_address": account.mailbox.full_address,
+                "quota": account.mailbox.quota,
+            },
+            "domains": ["test.com", "test2.com"],
+        }
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        domains = models.Domain.objects.get_for_admin(account)
+        self.assertEqual(domains.count(), 2)
+        self.assertTrue(domains.filter(name="test2.com").exists())
+
+        data["domains"] = ["test2.com"]
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        domains = models.Domain.objects.get_for_admin(account)
+        self.assertEqual(domains.count(), 1)
+        self.assertTrue(domains.filter(name="test2.com").exists())
+
+    def test_update_account_wrong_address(self):
+        """Try to update an account."""
+        account = core_models.User.objects.get(username="user@test.com")
+        url = reverse("v1:account-detail", args=[account.pk])
+        data = {
+            "username": "fromapi@test3.com",
+            "role": account.role,
+            "password": "Toto1234",
+            "mailbox": {
+                "full_address": "fromapi@test3.com",
+                "quota": account.mailbox.quota,
+            },
+        }
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 404)
+
+    def test_delete_account(self):
+        """Try to delete an account."""
+        account = core_models.User.objects.get(username="user@test.com")
+        domadmin = core_models.User.objects.get(username="admin@test.com")
+        self.assertTrue(domadmin.can_access(account))
+        url = reverse("v1:account-detail", args=[account.pk])
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(core_models.User.objects.filter(pk=account.pk).exists())
+        self.assertFalse(domadmin.can_access(account))
+
+    def test_account_exists(self):
+        """Validate /exists/ service."""
+        url = reverse("v1:account-exists")
+        response = self.client.get("{}?email={}".format(url, "user@test.com"))
+        self.assertEqual(response.status_code, 200)
+        content = response.json()
+        self.assertTrue(content["exists"])
+        response = self.client.get("{}?email={}".format(url, "pipo@test.com"))
+        self.assertEqual(response.status_code, 200)
+        content = response.json()
+        self.assertFalse(content["exists"])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 400)
+
+    def test_change_password(self):
+        """Check the change password service."""
+        account = core_models.User.objects.get(username="user@test.com")
+        url = reverse("v1:account-password", args=[account.pk])
+        response = self.client.put(
+            url, {"password": "toto", "new_password": "pass"}, format="json"
+        )
+        # must fail because password is too weak
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.put(
+            url, {"password": "toto", "new_password": "Toto1234"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertIsNot(
+            authenticate(username=account.username, password="Toto1234"), None
+        )
+
+    def test_change_password_as_domainadmin(self):
+        """A domain admin can change a password of an account they manage."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        account = core_models.User.objects.get(username="user@test.com")
+        url = reverse("v1:account-password", args=[account.pk])
+        response = self.client.put(
+            url, {"password": "toto", "new_password": "Toto1234"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        account.refresh_from_db()
+        self.assertIsNot(
+            authenticate(username=account.username, password="Toto1234"), None
+        )
+
+    def test_change_password_of_superadmin_denied(self):
+        """A domain admin must not change a super admin's password.
+
+        Regression test for an IDOR allowing a domain administrator to take
+        over a super admin account by targeting its primary key directly.
+        The targeted account is outside the admin's scope and must not be
+        reachable: the endpoint answers 404 instead of changing the password.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        superadmin = self.sadmin
+        url = reverse("v1:account-password", args=[superadmin.pk])
+        response = self.client.put(
+            url, {"password": "password", "new_password": "Toto1234"}, format="json"
+        )
+        self.assertEqual(response.status_code, 404)
+        superadmin.refresh_from_db()
+        # The super admin credentials are left untouched.
+        self.assertIsNot(
+            authenticate(username=superadmin.username, password="password"), None
+        )
+        self.assertIs(
+            authenticate(username=superadmin.username, password="Toto1234"), None
+        )
+
+    def test_change_password_of_account_from_other_domain_denied(self):
+        """A domain admin must not change a password outside their domains."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        account = core_models.User.objects.get(username="user@test2.com")
+        url = reverse("v1:account-password", args=[account.pk])
+        response = self.client.put(
+            url, {"password": "toto", "new_password": "Toto1234"}, format="json"
+        )
+        self.assertEqual(response.status_code, 404)
+        account.refresh_from_db()
+        self.assertIsNot(authenticate(username=account.username, password="toto"), None)
+        self.assertIs(
+            authenticate(username=account.username, password="Toto1234"), None
+        )
+
+    @mock.patch("ovh.Client.get")
+    @mock.patch("ovh.Client.post")
+    def test_reset_password(self, client_post, client_get):
+        url = reverse("v1:account-reset-password")
+        # SMS password recovery not enabled
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 404)
+
+        self.set_global_parameters(
+            {
+                "sms_password_recovery": True,
+                "sms_provider": "ovh",
+                "sms_ovh_application_key": "key",
+                "sms_ovh_application_secret": "secret",
+                "sms_ovh_consumer_key": "consumer",
+            },
+            app="core",
+        )
+        # No email provided
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 400)
+
+        account = core_models.User.objects.get(username="user@test.com")
+        data = {"email": account.email}
+        # No phone number
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 404)
+
+        account.phone_number = "+33612345678"
+        account.save()
+        client_get.return_value = ["service"]
+        client_post.return_value = {"totalCreditsRemoved": 1}
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+
+    @mock.patch("ovh.Client.get")
+    @mock.patch("ovh.Client.post")
+    def test_reset_password_unmanaged_account(self, client_post, client_get):
+        """A domain admin can't reset the password of an account it can't access."""
+        self.set_global_parameters(
+            {
+                "sms_password_recovery": True,
+                "sms_provider": "ovh",
+                "sms_ovh_application_key": "key",
+                "sms_ovh_application_secret": "secret",
+                "sms_ovh_consumer_key": "consumer",
+            },
+            app="core",
+        )
+        client_get.return_value = ["service"]
+        client_post.return_value = {"totalCreditsRemoved": 1}
+        self.sadmin.email = "sadmin@test.com"
+        self.sadmin.save()
+        url = reverse("v1:account-reset-password")
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        for username in ["admin", "user@test2.com"]:
+            account = core_models.User.objects.get(username=username)
+            account.phone_number = "+33612345678"
+            account.save()
+            response = self.client.post(url, {"email": account.email}, format="json")
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(
+                core_models.User.objects.get(pk=account.pk).password, account.password
+            )
+        client_post.assert_not_called()
+
+    @mock.patch("ovh.Client.get")
+    @mock.patch("ovh.Client.post")
+    def test_locked_fields(self, client_post, client_get):
+        """Plugins lock fields of an account (see the signal)."""
+
+        def lock_fields(sender, account, **kwargs):
+            return ["password", "role"] if account.username == "user@test.com" else []
+
+        admin_signals.extra_account_locked_fields.connect(lock_fields)
+        self.addCleanup(
+            admin_signals.extra_account_locked_fields.disconnect, lock_fields
+        )
+        account = core_models.User.objects.get(username="user@test.com")
+        url = reverse("v1:account-detail", args=[account.pk])
+        # Unchanged values are accepted
+        response = self.client.patch(url, {"role": "SimpleUsers"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        for data in [{"role": "DomainAdmins"}, {"password": "Toto12345"}]:
+            response = self.client.patch(url, data, format="json")
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(next(iter(data)), response.json())
+        # No password sent by SMS either
+        self.set_global_parameters(
+            {
+                "sms_password_recovery": True,
+                "sms_provider": "ovh",
+                "sms_ovh_application_key": "key",
+                "sms_ovh_application_secret": "secret",
+                "sms_ovh_consumer_key": "consumer",
+            },
+            app="core",
+        )
+        account.phone_number = "+33612345678"
+        account.save()
+        response = self.client.post(
+            reverse("v1:account-reset-password"),
+            {"email": account.email},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+        client_post.assert_not_called()
+        self.assertEqual(
+            core_models.User.objects.get(pk=account.pk).password, account.password
+        )
+
+    def test_account_exists_unmanaged_account(self):
+        """/exists/ only reports accounts the admin can access."""
+        self.sadmin.email = "sadmin@test.com"
+        self.sadmin.save()
+        url = reverse("v1:account-exists")
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        for email, exists in [
+            ("user@test.com", True),
+            ("user@test2.com", False),
+            ("sadmin@test.com", False),
+        ]:
+            response = self.client.get(url, {"email": email})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["exists"], exists)
+
+
+class AliasAPITestCase(ModoAPITestCase):
+    """Check Alias API."""
+
+    ALIAS_DATA = {
+        "address": "alias_fromapi@test.com",
+        "recipients": ["user@test.com", "postmaster@test.com", "user_éé@nonlocal.com"],
+    }
+
+    @classmethod
+    def setUpTestData(cls):  # NOQA:N802
+        """Create test data."""
+        super().setUpTestData()
+        cls.localconfig.parameters.set_value("enable_admin_limits", False, app="limits")
+        cls.localconfig.save()
+        factories.populate_database()
+        cls.da_token = Token.objects.create(
+            user=core_models.User.objects.get(username="admin@test.com")
+        )
+
+    def test_get_aliases(self):
+        """Retrieve a list of aliases."""
+        url = reverse("v1:alias-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 3)
+
+        response = self.client.get(f"{url}?domain=test.com")
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 3)
+
+        response = self.client.get(f"{url}?domain=test2.com")
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 0)
+
+    def test_get_alias(self):
+        """Retrieve an alias."""
+        al = models.Alias.objects.get(address="alias@test.com")
+        url = reverse("v1:alias-detail", args=[al.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(response["recipients"], ["user@test.com"])
+
+    def test_create_alias(self):
+        """Try to create a new alias."""
+        url = reverse("v1:alias-list")
+        response = self.client.post(url, self.ALIAS_DATA, format="json")
+        self.assertEqual(response.status_code, 201)
+
+        alias = json.loads(response.content.decode("utf-8"))
+        alias = models.Alias.objects.filter(pk=alias["pk"]).first()
+        domadmin = core_models.User.objects.get(username="admin@test.com")
+        self.assertTrue(domadmin.can_access(alias))
+        self.assertEqual(alias.aliasrecipient_set.count(), 3)
+        self.assertTrue(
+            alias.aliasrecipient_set.filter(
+                address="user@test.com", r_mailbox__isnull=False
+            ).exists()
+        )
+        self.assertTrue(
+            alias.aliasrecipient_set.filter(
+                address="postmaster@test.com", r_alias__isnull=False
+            ).exists()
+        )
+        self.assertTrue(
+            alias.aliasrecipient_set.filter(
+                address="user_éé@nonlocal.com",
+                r_mailbox__isnull=True,
+                r_alias__isnull=True,
+            ).exists()
+        )
+
+        # Create catchall alias
+        data = copy.deepcopy(self.ALIAS_DATA)
+        data["address"] = "@test.com"
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_create_duplicate_alias(self):
+        url = reverse("v1:alias-list")
+        response = self.client.post(url, self.ALIAS_DATA, format="json")
+        self.assertEqual(response.status_code, 201)
+
+        # Try with same address but different case
+        data = copy.deepcopy(self.ALIAS_DATA)
+        data["address"] = "ALIAS_fromapi@test.com"
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_alias_as_domadmin(self):
+        """As DomainAdmin, try to create a new alias."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        url = reverse("v1:alias-list")
+        response = self.client.post(url, self.ALIAS_DATA, format="json")
+        self.assertEqual(response.status_code, 201)
+
+        data = copy.deepcopy(self.ALIAS_DATA)
+        data["address"] = "alias_fromapi@test2.com"
+        response = self.client.post(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+        errors = response.json()
+        self.assertIn("address", errors)
+
+    def test_update_alias(self):
+        """Try to update an alias."""
+        alias = models.Alias.objects.get(address="alias@test.com")
+        url = reverse("v1:alias-detail", args=[alias.pk])
+        data = {
+            "address": "alias@test.com",
+            "recipients": ["user@test.com", "user@nonlocal.com"],
+        }
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        alias.refresh_from_db()
+        self.assertEqual(alias.aliasrecipient_set.count(), 2)
+        data = {"address": "alias@test.com", "recipients": ["user@nonlocal.com"]}
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 200)
+        alias.refresh_from_db()
+        self.assertEqual(alias.aliasrecipient_set.count(), 1)
+
+        data = {"address": "alias@test.com", "recipients": []}
+        response = self.client.put(url, data, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_delete_alias(self):
+        """Try to delete an existing alias."""
+        alias = models.Alias.objects.get(address="alias@test.com")
+        domadmin = core_models.User.objects.get(username="admin@test.com")
+        self.assertTrue(domadmin.can_access(alias))
+        url = reverse("v1:alias-detail", args=[alias.pk])
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(models.Alias.objects.filter(pk=alias.pk).exists())
+        self.assertFalse(domadmin.can_access(alias))
+        self.assertFalse(
+            models.AliasRecipient.objects.filter(
+                address="user@test.com", alias__address="alias@test.com"
+            ).exists()
+        )
+
+
+class SenderAddressAPITestCase(ModoAPITestCase):
+    """Check SenderAddress API."""
+
+    @classmethod
+    def setUpTestData(cls):  # NOQA:N802
+        """Create test data."""
+        super().setUpTestData()
+        cls.localconfig.parameters.set_value("enable_admin_limits", False, app="limits")
+        cls.localconfig.save()
+        factories.populate_database()
+        cls.sa1 = factories.SenderAddressFactory(
+            address="test@domain.ext",
+            mailbox__user__username="user@test.com",
+            mailbox__address="user",
+            mailbox__domain__name="test.com",
+        )
+        cls.da_token = Token.objects.create(
+            user=core_models.User.objects.get(username="admin@test.com")
+        )
+
+    def test_list(self):
+        """Retrieve a list of sender addresses."""
+        url = reverse("v1:sender_address-list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        response = response.json()
+        self.assertEqual(len(response), 1)
+
+    def test_create(self):
+        """Create a new sender addresses."""
+        url = reverse("v1:sender_address-list")
+        mbox = models.Mailbox.objects.get(address="admin", domain__name="test.com")
+        data = {"address": "@extdomain.test", "mailbox": mbox.pk}
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 201)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.da_token.key)
+        data = {"address": "user@test2.com", "mailbox": mbox.pk}
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["address"][0], "You don't have access to this domain."
+        )
+
+        mbox = models.Mailbox.objects.get(address="admin", domain__name="test2.com")
+        data = {"address": "toto@titi.com", "mailbox": mbox.pk}
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["mailbox"][0], "You don't have access to this mailbox."
+        )
+
+    def test_patch(self):
+        """Patch an existing sender address."""
+        url = reverse("v1:sender_address-detail", args=[self.sa1.pk])
+        mbox = models.Mailbox.objects.get(address="user", domain__name="test.com")
+        data = {"address": "@extdomain.test"}
+        response = self.client.patch(url, data)
+        self.assertEqual(response.status_code, 200)
+        self.sa1.refresh_from_db()
+        self.assertEqual(self.sa1.mailbox, mbox)
+        self.assertEqual(self.sa1.address, data["address"])
+
+    def test_update(self):
+        """Update an existing sender address."""
+        url = reverse("v1:sender_address-detail", args=[self.sa1.pk])
+        mbox = models.Mailbox.objects.get(address="user", domain__name="test.com")
+        data = {"address": "@extdomain.test", "mailbox": mbox.pk}
+        response = self.client.put(url, data)
+        self.assertEqual(response.status_code, 200)
+        self.sa1.refresh_from_db()
+        self.assertEqual(self.sa1.mailbox, mbox)
+        self.assertEqual(self.sa1.address, data["address"])
+
+    def test_delete(self):
+        """Delete an existing sender address."""
+        url = reverse("v1:sender_address-detail", args=[self.sa1.pk])
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 204)
+        with self.assertRaises(models.SenderAddress.DoesNotExist):
+            self.sa1.refresh_from_db()
